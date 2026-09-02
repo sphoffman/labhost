@@ -1,0 +1,246 @@
+#!/bin/bash
+set -euo pipefail
+
+STATE=/run/labhost
+CONFIG_DIR=/config
+MGMT_IF="${LABHOST_MGMT_IF:-eth0}"
+MGMT_VRF="${LABHOST_MGMT_VRF:-vrf-mgmt}"
+DEFAULT_DATA_MTU="${LABHOST_DATA_MTU:-9000}"
+INTENT_DIR="${LABHOST_INTENT_DIR:-$CONFIG_DIR/.labhost}"
+CLIENT_INTENT_DIR="$INTENT_DIR/clients"
+DHCP_INTENT_DIR="$INTENT_DIR/dhcp"
+DHCP_SERVER_INTENT_DIR="$INTENT_DIR/dhcp-server"
+DHCP_SERVER_RUN_DIR="$STATE/dhcp-server"
+PC_PHONE_INTENT_DIR="$INTENT_DIR/pc-phones"
+PC_PHONE_RUN_DIR="$STATE/pc-phones"
+MTU_ALL_INTENT="$INTENT_DIR/mtu-all"
+
+sudo_if_needed(){ if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+exists(){ ip link show "$1" >/dev/null 2>&1; }
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    cat <<'EOF'
+Usage: lab-reset
+
+Remove helper-created/test state while preserving the Containerlab physical
+interfaces eth1, eth2, ... plus eth0/vrf-mgmt and /config/<hostname>.sh.
+EOF
+    exit 0
+fi
+[[ $# -eq 0 ]] || { echo "ERROR: lab-reset takes no arguments." >&2; exit 2; }
+
+# Snapshot Containerlab dataplane interfaces before doing anything destructive.
+# These names are a hard preservation boundary for this reset.
+mapfile -t PHYSICAL_IFACES < <(
+    for path in /sys/class/net/eth[1-9]*; do
+        [[ -e "$path" ]] || continue
+        i="${path##*/}"
+        [[ "$i" =~ ^eth[1-9][0-9]*$ ]] && printf '%s\n' "$i"
+    done | sort -V
+)
+
+declare -A PROTECTED=()
+declare -A BEFORE_IFINDEX=()
+for i in "${PHYSICAL_IFACES[@]}"; do
+    PROTECTED["$i"]=1
+    BEFORE_IFINDEX["$i"]="$(cat "/sys/class/net/$i/ifindex")"
+done
+PROTECTED["$MGMT_IF"]=1
+PROTECTED["$MGMT_VRF"]=1
+PROTECTED[lo]=1
+
+is_protected(){ [[ -n "${PROTECTED[$1]:-}" ]]; }
+
+stop_pid_wait(){
+    local pidfile="$1" pid
+    [[ -r "$pidfile" ]] || return 0
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+        sudo_if_needed kill "$pid" 2>/dev/null || true
+        for _ in {1..30}; do
+            ps -p "$pid" >/dev/null 2>&1 || break
+            sleep 0.1
+        done
+        if ps -p "$pid" >/dev/null 2>&1; then
+            sudo_if_needed kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+}
+
+cleanup_phone_parent(){
+    local parent="$1" pidfile statefile origmac pc voice_iface original_mac
+    is_protected "$parent" || {
+        echo "WARNING: refusing PC/phone cleanup for non-physical parent '$parent'" >&2
+        return 0
+    }
+    exists "$parent" || {
+        echo "ERROR: protected interface '$parent' disappeared before phone cleanup." >&2
+        return 1
+    }
+
+    pidfile="$PC_PHONE_RUN_DIR/${parent}.pid"
+    statefile="$PC_PHONE_RUN_DIR/${parent}.state"
+    origmac="$PC_PHONE_RUN_DIR/${parent}.origmac"
+    pc="pp-${parent}-pc"; pc="${pc:0:15}"
+
+    # Stop the LLDP-MED agent and wait for it to be gone before deleting any
+    # derived interface.  This prevents provisioning from racing reset.
+    stop_pid_wait "$pidfile"
+
+    voice_iface=""
+    if [[ -r "$statefile" ]]; then
+        unset vlan tagged priority dscp voice_iface
+        # shellcheck disable=SC1090
+        source "$statefile"
+    fi
+
+    # Stop DHCP on derived objects before deleting them.
+    if [[ -n "${voice_iface:-}" && "$voice_iface" != "$parent" ]]; then
+        sudo_if_needed dhcpcd -k "$voice_iface" >/dev/null 2>&1 || true
+    fi
+    sudo_if_needed dhcpcd -k "$pc" >/dev/null 2>&1 || true
+
+    # Hard rule: reset may delete only pp-* objects here, never the parent.
+    if [[ -n "${voice_iface:-}" && "$voice_iface" != "$parent" ]]; then
+        if [[ "$voice_iface" == pp-* ]]; then
+            sudo_if_needed ip link del "$voice_iface" 2>/dev/null || true
+        else
+            echo "WARNING: refusing to delete unexpected voice interface '$voice_iface'" >&2
+        fi
+    fi
+    [[ "$pc" == pp-* ]] && sudo_if_needed ip link del "$pc" 2>/dev/null || true
+
+    # Restore Containerlab's original MAC if the phone abstraction changed it.
+    if [[ -r "$origmac" ]]; then
+        original_mac="$(tr -d '[:space:]' <"$origmac")"
+        if [[ "$original_mac" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
+            sudo_if_needed ip link set dev "$parent" down
+            sudo_if_needed ip link set dev "$parent" address "$original_mac"
+            sudo_if_needed ip link set dev "$parent" up
+        fi
+    fi
+
+    sudo_if_needed lldpcli configure ports "$parent" lldp status rx-and-tx >/dev/null 2>&1 || true
+    rm -f "$PC_PHONE_INTENT_DIR/${parent}.conf" "$pidfile" "$statefile" \
+          "$PC_PHONE_RUN_DIR/${parent}.log" "$origmac" 2>/dev/null || true
+}
+
+echo 'Removing PC/phone objects...'
+# Build the cleanup set from both intent and runtime state, but only operate on
+# the protected physical interfaces captured at reset start.
+declare -A PHONE_PARENTS=()
+if [[ -d "$PC_PHONE_INTENT_DIR" ]]; then
+    for f in "$PC_PHONE_INTENT_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        PHONE_PARENTS["$(basename "$f" .conf)"]=1
+    done
+fi
+if [[ -d "$PC_PHONE_RUN_DIR" ]]; then
+    for f in "$PC_PHONE_RUN_DIR"/*.origmac; do
+        [[ -e "$f" ]] || continue
+        PHONE_PARENTS["$(basename "$f" .origmac)"]=1
+    done
+fi
+for parent in "${!PHONE_PARENTS[@]}"; do
+    cleanup_phone_parent "$parent"
+done
+rm -rf "$PC_PHONE_RUN_DIR" 2>/dev/null || true
+rm -f "$PC_PHONE_INTENT_DIR"/*.conf 2>/dev/null || true
+
+echo 'Stopping DHCP services and clients...'
+/usr/local/bin/dhcp-server-stop >/dev/null 2>&1 || true
+sudo_if_needed pkill -x dhcpcd 2>/dev/null || true
+rm -f "$DHCP_INTENT_DIR"/* 2>/dev/null || true
+rm -f "$DHCP_SERVER_INTENT_DIR"/*.conf "$DHCP_SERVER_INTENT_DIR/.enabled" 2>/dev/null || true
+sudo_if_needed rm -rf "$DHCP_SERVER_RUN_DIR" 2>/dev/null || true
+
+echo 'Removing test qdiscs...'
+while read -r i; do
+    [[ -n "$i" ]] || continue
+    sudo_if_needed tc qdisc del dev "$i" root 2>/dev/null || true
+done < <(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1)
+
+echo 'Removing macvlan clients...'
+/usr/local/bin/clients-delete >/dev/null 2>&1 || true
+rm -f "$CLIENT_INTENT_DIR"/cl*-cl*.conf 2>/dev/null || true
+
+echo 'Removing VLAN/QinQ interfaces...'
+mapfile -t VLANS < <(ip -d -o link show type vlan 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | tac)
+for v in "${VLANS[@]}"; do
+    [[ -n "$v" ]] || continue
+    if is_protected "$v"; then
+        echo "WARNING: refusing to delete protected interface '$v' reported as VLAN" >&2
+        continue
+    fi
+    sudo_if_needed ip link del "$v" 2>/dev/null || true
+done
+
+echo 'Removing bonds...'
+if compgen -G '/proc/net/bonding/*' >/dev/null; then
+    for f in /proc/net/bonding/*; do
+        bond="${f##*/}"
+        is_protected "$bond" && continue
+        # Detach protected members before deleting the virtual bond.
+        while read -r m; do
+            [[ -n "$m" ]] || continue
+            is_protected "$m" && sudo_if_needed ip link set "$m" nomaster 2>/dev/null || true
+        done < <(ip -o link show master "$bond" 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1)
+        sudo_if_needed ip link del "$bond" 2>/dev/null || true
+    done
+fi
+
+echo 'Removing user-created VRFs...'
+mapfile -t VRFS < <(ip -o link show type vrf 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}' | cut -d@ -f1)
+for v in "${VRFS[@]}"; do
+    [[ -n "$v" ]] || continue
+    is_protected "$v" && continue
+    # Detach protected physical members before deleting the VRF device.
+    for i in "${PHYSICAL_IFACES[@]}"; do
+        if ip -o link show master "$v" 2>/dev/null | grep -q " $i"; then
+            sudo_if_needed ip link set "$i" nomaster 2>/dev/null || true
+        fi
+    done
+    sudo_if_needed ip link del "$v" 2>/dev/null || true
+done
+
+sudo_if_needed ip link del br-wan 2>/dev/null || true
+sudo_if_needed pkill -f 'python3 -m http.server|in.tftpd|socat.*LISTEN|iperf3 -s|iperf -s' 2>/dev/null || true
+
+echo 'Flushing dataplane addresses and routes...'
+for i in "${PHYSICAL_IFACES[@]}"; do
+    exists "$i" || continue
+    sudo_if_needed ip link set "$i" nomaster 2>/dev/null || true
+    sudo_if_needed ip -4 addr flush dev "$i" scope global 2>/dev/null || true
+    sudo_if_needed ip -6 addr flush dev "$i" scope global 2>/dev/null || true
+    sudo_if_needed ip -4 route flush dev "$i" 2>/dev/null || true
+    sudo_if_needed ip -6 route flush dev "$i" 2>/dev/null || true
+done
+
+echo 'Restoring default dataplane MTU...'
+for i in "${PHYSICAL_IFACES[@]}"; do
+    exists "$i" || continue
+    sudo_if_needed ip link set dev "$i" mtu "$DEFAULT_DATA_MTU" 2>/dev/null || true
+    sudo_if_needed ip link set dev "$i" up 2>/dev/null || true
+    sudo_if_needed lldpcli configure ports "$i" lldp status rx-and-tx >/dev/null 2>&1 || true
+done
+rm -f "$MTU_ALL_INTENT" 2>/dev/null || true
+
+# This is the regression guard that r2 lacked. Every physical interface present
+# before reset must still exist with the same ifindex afterward.
+failed=0
+for i in "${PHYSICAL_IFACES[@]}"; do
+    if ! exists "$i"; then
+        echo "ERROR: protected physical interface '$i' is missing after reset." >&2
+        failed=1
+        continue
+    fi
+    after="$(cat "/sys/class/net/$i/ifindex")"
+    if [[ "$after" != "${BEFORE_IFINDEX[$i]}" ]]; then
+        echo "ERROR: protected physical interface '$i' was replaced (ifindex ${BEFORE_IFINDEX[$i]} -> $after)." >&2
+        failed=1
+    fi
+done
+
+(( failed == 0 )) || exit 1
+
+echo "Reset complete; preserved ${#PHYSICAL_IFACES[@]} physical dataplane interface(s), management VRF/path, and saved startup script."
