@@ -24,7 +24,7 @@ FROM debian:13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENV LABHOST_VERSION="1.4-dev9"
+ENV LABHOST_VERSION="1.4-dev10"
 
 # Avoid interactive package prompts.
 RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' \
@@ -109,8 +109,8 @@ COPY README.md /usr/local/share/labhost/README.md
 COPY motd /etc/motd
 
 # labctl is the common implementation. Friendly command names are symlinks;
-# lab-reset is a dedicated guarded implementation in dev9 so reset cannot
-# delete Containerlab-provided physical dataplane interfaces.
+# lab-reset is a dedicated guarded implementation so reset cannot delete
+# Containerlab-provided physical dataplane interfaces.
 RUN chmod 0755 \
         /usr/local/bin/labctl \
         /usr/local/bin/lab-reset \
