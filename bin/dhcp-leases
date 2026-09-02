@@ -1,0 +1,67 @@
+#!/bin/bash
+set -euo pipefail
+
+LEASE_FILE="${LABHOST_DHCP_LEASES:-/run/labhost/dhcp-server/dnsmasq.leases}"
+
+usage(){
+    cat <<'EOF'
+Usage:
+  dhcp-leases
+  dhcp-leases --raw
+
+Shows active dnsmasq DHCP leases in a readable table.
+--raw prints the underlying dnsmasq lease file unchanged.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  --raw)
+    [[ -r "$LEASE_FILE" ]] || { echo "No DHCP lease file found: $LEASE_FILE"; exit 0; }
+    cat "$LEASE_FILE"
+    exit 0
+    ;;
+  "") ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [[ ! -r "$LEASE_FILE" || ! -s "$LEASE_FILE" ]]; then
+    echo "No active DHCP leases."
+    exit 0
+fi
+
+printf '%-18s %-15s %-20s %-19s %s\n' "MAC" "IP" "HOST" "EXPIRES" "CLIENT_ID"
+printf '%-18s %-15s %-20s %-19s %s\n' "-----------------" "---------------" "--------------------" "-------------------" "---------"
+
+now="$(date +%s)"
+total=0
+
+while read -r expiry mac ip host client_id rest; do
+    [[ -n "${mac:-}" && -n "${ip:-}" ]] || continue
+
+    if [[ "$expiry" == "0" ]]; then
+        expires="never"
+    elif [[ "$expiry" =~ ^[0-9]+$ ]]; then
+        if (( expiry <= now )); then
+            expires="expired"
+        else
+            expires="$(date -d "@$expiry" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$expiry")"
+        fi
+    else
+        expires="$expiry"
+    fi
+
+    [[ "${host:-}" == "*" ]] && host="-"
+    [[ -n "${client_id:-}" ]] || client_id="-"
+
+    printf '%-18s %-15s %-20s %-19s %s\n' "$mac" "$ip" "$host" "$expires" "$client_id"
+    total=$((total + 1))
+done < <(sort -t. -k1,1n -k2,2n -k3,3n -k4,4n "$LEASE_FILE")
+
+printf '\nTotal active leases: %d\n' "$total"
