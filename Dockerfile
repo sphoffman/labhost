@@ -24,7 +24,7 @@ FROM debian:13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENV LABHOST_VERSION="1.4-dev8"
+ENV LABHOST_VERSION="1.4-dev9"
 
 # Avoid interactive package prompts.
 RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' \
@@ -102,19 +102,22 @@ RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' \
 COPY --from=mcjoin-builder /usr/local/ /usr/local/
 
 COPY bin/labctl /usr/local/bin/labctl
+COPY bin/lab-reset /usr/local/bin/lab-reset
 COPY lib/pc_phone_lldp.py /usr/local/lib/labhost/pc_phone_lldp.py
 COPY entrypoint.sh /usr/local/bin/labhost-entrypoint
 COPY README.md /usr/local/share/labhost/README.md
 COPY motd /etc/motd
 
-# labctl is the common implementation.  Friendly command names are
-# symlinks so every helper remains a normal shell command.
+# labctl is the common implementation. Friendly command names are symlinks;
+# lab-reset is a dedicated guarded implementation in dev9 so reset cannot
+# delete Containerlab-provided physical dataplane interfaces.
 RUN chmod 0755 \
         /usr/local/bin/labctl \
+        /usr/local/bin/lab-reset \
         /usr/local/bin/labhost-entrypoint \
         /usr/local/lib/labhost/pc_phone_lldp.py \
     && for cmd in \
-        lab-help lab-status lab-reset lab-save lab-config lab-readme \
+        lab-help lab-status lab-save lab-config lab-readme \
         mgmt-vrf-status \
         vrf-create vrf-delete vrf-add vrf-remove vrf-status \
         vrf-route-add vrf-route-del vrf-exec \
