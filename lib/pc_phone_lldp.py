@@ -5,7 +5,7 @@ Sends a phone LLDP identity on a physical parent, learns an LLDP-MED Voice
 Network Policy from the attached switch, and materializes the tagged voice
 interface using the same deterministic phone MAC.
 """
-import argparse, os, socket, struct, subprocess, time, signal, sys
+import argparse, os, socket, struct, subprocess, time
 
 LLDP_DST = bytes.fromhex('0180c200000e')
 MED_OUI = bytes.fromhex('0012bb')
@@ -18,14 +18,14 @@ def macb(mac): return bytes.fromhex(mac.replace(':',''))
 
 def frame(src, ifname, sysname):
     body=b''.join([
-        tlv(1, b'\x04'+macb(src)),                  # chassis ID: MAC
-        tlv(2, b'\x05'+ifname.encode()),            # port ID: interface name
-        tlv(3, struct.pack('!H',120)),               # TTL
+        tlv(1, b'\x04'+macb(src)),
+        tlv(2, b'\x05'+ifname.encode()),
+        tlv(3, struct.pack('!H',120)),
         tlv(4, f'{sysname} phone uplink'.encode()),
         tlv(5, sysname.encode()),
         tlv(6, b'labhost simulated LLDP-MED phone'),
-        tlv(7, struct.pack('!HH',0x0020,0x0020)),       # supported/enabled: Telephone
-        tlv(127, MED_OUI+b'\x01'+bytes.fromhex('000303')), # MED caps: capabilities + network policy, endpoint III
+        tlv(7, struct.pack('!HH',0x0020,0x0020)),
+        tlv(127, MED_OUI+b'\x01'+bytes.fromhex('000303')),
         tlv(0,b'')])
     return LLDP_DST+macb(src)+struct.pack('!H',0x88cc)+body
 
@@ -40,7 +40,7 @@ def parse_med(pkt):
         if typ==0: break
         if typ==127 and len(val)>=8 and val[:3]==MED_OUI and val[3]==2:
             app=val[4]
-            if app != 1: continue  # Voice application
+            if app != 1: continue
             pol=int.from_bytes(val[5:8],'big')
             unknown=bool(pol & (1<<23)); tagged=bool(pol & (1<<22))
             vlan=(pol>>9)&0xfff; prio=(pol>>6)&0x7; dscp=pol&0x3f
@@ -51,11 +51,17 @@ def parse_med(pkt):
 def run(*args): subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def exists(dev): return subprocess.run(['ip','link','show',dev],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
 
+def dhcp_start(iface, mac):
+    # Explicit RFC2132 Ethernet client identifier: type 1 + deterministic MAC.
+    # dhcpcd otherwise derives an IAID from the VLAN ID for VLAN interfaces,
+    # causing every simulated phone on the same voice VLAN to share one DHCP
+    # identity and replace the previous phone's dnsmasq lease.
+    client_id='01:'+mac.lower()
+    subprocess.run(['dhcpcd','-4','-q','-b','-C','resolv.conf','-I',client_id,iface],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+
 def provision(parent, phone_mac, vlan, tagged, prio, dscp, statefile, dhcp):
     voice=f'pp-{parent}-v{vlan}'[:15]
     if not tagged:
-        # A voice policy can explicitly request untagged voice. Keep LLDP/native
-        # identity only; don't create a tagged VLAN that would misrepresent it.
         with open(statefile,'w') as f: f.write(f'vlan={vlan}\ntagged=0\npriority={prio}\ndscp={dscp}\nvoice_iface={parent}\n')
         return
     old=None
@@ -65,8 +71,7 @@ def provision(parent, phone_mac, vlan, tagged, prio, dscp, statefile, dhcp):
     if old and old != voice and old != parent and exists(old): run('ip','link','del',old)
     if not exists(voice): run('ip','link','add','link',parent,'name',voice,'type','vlan','id',str(vlan))
     run('ip','link','set',voice,'down'); run('ip','link','set',voice,'address',phone_mac); run('ip','link','set',voice,'up')
-    if dhcp:
-        subprocess.run(['dhcpcd','-4','-q','-b','-C','resolv.conf',voice],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    if dhcp: dhcp_start(voice, phone_mac)
     with open(statefile,'w') as f: f.write(f'vlan={vlan}\ntagged=1\npriority={prio}\ndscp={dscp}\nvoice_iface={voice}\n')
 
 def main():
