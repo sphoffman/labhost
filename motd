@@ -1,0 +1,22 @@
+============================================================
+ labhost v1.3 - Containerlab Network Swiss Army Knife
+============================================================
+
+ Quick start:
+   lab-help        Show all helper commands
+   lab-status      Show interfaces, routes, VRFs, LAGs,
+                   VLANs, NetEm/qdisc state, and ports
+   lab-readme      Open the full usage guide
+
+ Persistence:
+   lab-save --dry-run   Preview saved startup configuration
+   lab-save             Save current supported network state
+   lab-config           Display saved startup configuration
+
+ Management:
+   eth0 -> vrf-mgmt / routing table 4094
+
+ Full README:
+   /usr/local/share/labhost/README.md
+
+============================================================

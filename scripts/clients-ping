@@ -1,0 +1,24 @@
+#!/bin/bash
+set -euo pipefail
+
+dst="${1:?Usage: clients-ping <destination> [count]}"
+count="${2:-1}"
+
+for iface in $(ip -o link show type macvlan | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^cl[0-9]' | sort); do
+    ipaddr="$(
+        ip -4 -o addr show dev "$iface" |
+        awk '{print $4}' |
+        cut -d/ -f1 |
+        head -1
+    )"
+
+    [[ -n "$ipaddr" ]] || continue
+
+    printf '%-8s %-15s -> %-15s ' "$iface" "$ipaddr" "$dst"
+
+    if ping -I "$iface" -c "$count" -W 1 "$dst" >/dev/null 2>&1; then
+        echo "OK"
+    else
+        echo "NO REPLY"
+    fi
+done

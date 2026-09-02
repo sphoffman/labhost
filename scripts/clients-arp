@@ -1,0 +1,34 @@
+#!/bin/bash
+set -euo pipefail
+
+count=0
+
+for iface in $(
+    ip -o link show type macvlan |
+    awk -F': ' '{print $2}' |
+    cut -d@ -f1 |
+    grep '^cl[0-9]' |
+    sort
+); do
+    ipaddr="$(
+        ip -4 -o addr show dev "$iface" |
+        awk '{print $4}' |
+        cut -d/ -f1 |
+        head -1
+    )"
+
+    [[ -n "$ipaddr" ]] || continue
+
+    printf '%-8s %-15s ' "$iface" "$ipaddr"
+
+    if arping -A -c 1 -I "$iface" "$ipaddr" >/dev/null 2>&1; then
+        echo "ARP sent"
+        count=$((count + 1))
+    else
+        echo "FAILED"
+    fi
+done
+
+echo
+echo "$count gratuitous ARPs sent."
+

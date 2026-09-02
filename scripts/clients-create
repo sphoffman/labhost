@@ -1,0 +1,146 @@
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage:
+  clients-create <parent> <count> <subnet/prefix> [start]
+
+Examples:
+  clients-create eth1.100 50 192.168.100.0/24 200
+  clients-create eth1.200 100 192.168.200.0/24 100
+
+The script automatically continues client numbering from the
+highest existing cl### interface.
+
+Example:
+  Existing: cl001-cl050
+  Next run creates: cl051, cl052, ...
+
+[start] may be:
+  100               host offset within the subnet
+  192.168.200.100   literal starting IP address
+EOF
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+    exit 0
+fi
+
+if [[ $# -lt 3 ]]; then
+    usage
+    exit 2
+fi
+
+parent="$1"
+count="$2"
+cidr="$3"
+start="${4:-10}"
+
+if ! ip link show "$parent" >/dev/null 2>&1; then
+    echo "ERROR: Interface '$parent' does not exist." >&2
+    exit 1
+fi
+
+#
+# Find the highest existing cl### interface.
+#
+last_client="$(
+    ip -o link show type macvlan 2>/dev/null |
+    awk -F': ' '{print $2}' |
+    cut -d@ -f1 |
+    sed -nE 's/^cl([0-9]+)$/\1/p' |
+    sort -n |
+    tail -1
+)"
+
+if [[ -n "$last_client" ]]; then
+    client_start=$((10#$last_client + 1))
+else
+    client_start=1
+fi
+
+#
+# Generate client name, MAC and address tuples.
+#
+tmpfile="$(mktemp)"
+trap 'rm -f "$tmpfile"' EXIT
+
+python3 - "$count" "$cidr" "$start" "$client_start" >"$tmpfile" <<'PY'
+import ipaddress
+import sys
+
+count = int(sys.argv[1])
+cidr = sys.argv[2]
+start_arg = sys.argv[3]
+client_start = int(sys.argv[4])
+
+net = ipaddress.ip_network(cidr, strict=False)
+
+try:
+    first = net.network_address + int(start_arg)
+except ValueError:
+    first = ipaddress.ip_address(start_arg)
+
+    if first not in net:
+        raise SystemExit("starting IP is outside subnet")
+
+for offset in range(count):
+    ip = first + offset
+
+    if ip not in net or ip == net.broadcast_address:
+        raise SystemExit("address range exceeds subnet")
+
+    client_num = client_start + offset
+    name = f"cl{client_num:03d}"
+
+    n = client_num - 1
+
+    mac = (
+        f"02:00:"
+        f"{(n >> 16) & 255:02x}:"
+        f"{(n >> 8) & 255:02x}:"
+        f"{n & 255:02x}:"
+        f"{(n + 1) & 255:02x}"
+    )
+
+    print(name, mac, f"{ip}/{net.prefixlen}")
+PY
+
+created=0
+
+while read -r name mac addr; do
+
+    echo "Creating $name  $addr  $mac  on $parent"
+
+    sudo ip link add \
+        link "$parent" \
+        name "$name" \
+        address "$mac" \
+        type macvlan \
+        mode bridge
+
+    sudo ip addr add \
+        "$addr" \
+        dev "$name"
+
+    sudo ip link set \
+        "$name" \
+        up
+
+    sudo sysctl -w \
+        "net.ipv4.conf.${name}.arp_ignore=1" \
+        >/dev/null
+
+    sudo sysctl -w \
+        "net.ipv4.conf.${name}.arp_announce=2" \
+        >/dev/null
+
+    created=$((created + 1))
+
+done <"$tmpfile"
+
+echo
+echo "$created clients created."
+echo "Client interfaces now range through cl$(printf '%03d' $((client_start + created - 1)))."

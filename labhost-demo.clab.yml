@@ -1,0 +1,41 @@
+name: labhost-demo
+
+mgmt:
+  network: clab
+  ipv4-subnet: 172.20.20.0/24
+
+topology:
+  nodes:
+    client1:
+      kind: linux
+      image: labhost:latest
+      mgmt-ipv4: 172.20.20.101
+      env:
+        LAB_PASSWORD: lab
+      binds:
+        - ./pcaps/client1:/pcaps
+        - ./scripts:/scripts
+      capabilities:
+        add:
+          - NET_ADMIN
+          - NET_RAW
+
+    client2:
+      kind: linux
+      image: labhost:latest
+      mgmt-ipv4: 172.20.20.102
+      env:
+        LAB_PASSWORD: lab
+      binds:
+        - ./pcaps/client2:/pcaps
+        - ./scripts:/scripts
+      capabilities:
+        add:
+          - NET_ADMIN
+          - NET_RAW
+
+  links:
+    # Replace these with your actual Junos node/interface names.
+    # - endpoints: ["client1:eth1", "leaf1:eth1"]
+    # - endpoints: ["client1:eth2", "leaf2:eth1"]
+    # - endpoints: ["client2:eth1", "leaf1:eth2"]

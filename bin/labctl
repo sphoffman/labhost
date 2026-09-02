@@ -1,0 +1,1749 @@
+#!/bin/bash
+set -euo pipefail
+
+CMD="$(basename "$0")"
+if [[ "$CMD" == "labctl" ]]; then
+    CMD="${1:-lab-help}"
+    shift || true
+fi
+
+STATE=/run/labhost
+CONFIG_DIR=/config
+README_PATH=/usr/local/share/labhost/README.md
+MGMT_VRF="${LABHOST_MGMT_VRF:-vrf-mgmt}"
+MGMT_TABLE="${LABHOST_MGMT_TABLE:-4094}"
+MGMT_IF="${LABHOST_MGMT_IF:-eth0}"
+DEFAULT_DATA_MTU="${LABHOST_DATA_MTU:-9000}"
+INTENT_DIR="${LABHOST_INTENT_DIR:-$CONFIG_DIR/.labhost}"
+CLIENT_INTENT_DIR="$INTENT_DIR/clients"
+DHCP_INTENT_DIR="$INTENT_DIR/dhcp"
+DHCP_SERVER_INTENT_DIR="$INTENT_DIR/dhcp-server"
+DHCP_SERVER_RUN_DIR="$STATE/dhcp-server"
+DHCP_SERVER_CONF="$DHCP_SERVER_RUN_DIR/dnsmasq.conf"
+DHCP_SERVER_PID="$DHCP_SERVER_RUN_DIR/dnsmasq.pid"
+DHCP_SERVER_LEASES="$DHCP_SERVER_RUN_DIR/dnsmasq.leases"
+MTU_ALL_INTENT="$INTENT_DIR/mtu-all"
+PC_PHONE_INTENT_DIR="$INTENT_DIR/pc-phones"
+PC_PHONE_RUN_DIR="$STATE/pc-phones"
+
+mkdir -p "$STATE" 2>/dev/null || true
+
+die(){ echo "ERROR: $*" >&2; exit 1; }
+iface_exists(){ ip link show "$1" >/dev/null 2>&1 || die "Interface '$1' does not exist."; }
+sudo_if_needed(){ if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+strip_peer(){ sed -E 's/@if[0-9]+//g'; }
+want_help(){ [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; }
+require_args(){ local cmd="$1" need="$2"; shift 2; if [[ "$#" -lt "$need" ]]; then help_command "$cmd"; exit 2; fi; }
+
+vrf_dev(){
+    if [[ "$1" == vrf-* ]]; then
+        printf '%s\n' "$1"
+    else
+        printf 'vrf-%s\n' "$1"
+    fi
+}
+vrf_table(){
+    local dev; dev="$(vrf_dev "$1")"
+    ip -d link show "$dev" 2>/dev/null | sed -nE 's/.* vrf table ([0-9]+).*/\1/p' | head -1
+}
+startup_path(){ printf '%s/%s.sh\n' "$CONFIG_DIR" "$(hostname -s)"; }
+ensure_intent_dir(){ mkdir -p "$INTENT_DIR" "$CLIENT_INTENT_DIR" "$DHCP_INTENT_DIR" "$DHCP_SERVER_INTENT_DIR" "$PC_PHONE_INTENT_DIR" 2>/dev/null || true; }
+
+dhcp_intent_path(){ printf '%s/%s\n' "$DHCP_INTENT_DIR" "$1"; }
+is_dhcp_intent(){ [[ -r "$(dhcp_intent_path "$1")" ]]; }
+mark_dhcp_intent(){
+    ensure_intent_dir
+    printf 'dhcp\n' >"$(dhcp_intent_path "$1")"
+}
+clear_dhcp_intent(){ rm -f "$(dhcp_intent_path "$1")" 2>/dev/null || true; }
+
+dhcp_stop_iface(){
+    local iface="$1"
+    if command -v dhcpcd >/dev/null 2>&1; then
+        sudo_if_needed dhcpcd -k "$iface" >/dev/null 2>&1 || true
+    fi
+}
+
+dhcp_acquire(){
+    local iface="$1"
+    iface_exists "$iface"
+    command -v dhcpcd >/dev/null 2>&1 || die "dhcpcd is not installed."
+
+    sudo_if_needed ip link set "$iface" up
+    dhcp_stop_iface "$iface"
+    sudo_if_needed ip -4 addr flush dev "$iface" scope global 2>/dev/null || true
+
+    # Never allow dataplane DHCP to overwrite Docker/labhost management DNS.
+    if ! sudo_if_needed timeout 45 dhcpcd -4 -q -w -C resolv.conf "$iface"; then
+        die "DHCP failed on $iface (no lease within 45 seconds)."
+    fi
+
+    local addr
+    addr="$(ip -4 -o addr show dev "$iface" scope global | awk '{print $4}' | head -1)"
+    [[ -n "$addr" ]] || die "DHCP completed on $iface but no IPv4 address was installed."
+    echo "$iface DHCP lease: $addr"
+}
+
+dhcp_pool_path(){ printf '%s/%s.conf\n' "$DHCP_SERVER_INTENT_DIR" "$1"; }
+
+dhcp_server_build_conf(){
+    ensure_intent_dir
+    sudo_if_needed mkdir -p "$DHCP_SERVER_RUN_DIR"
+    local tmp; tmp="$(mktemp)"
+    {
+        echo 'port=0'
+        echo 'bind-dynamic'
+        echo 'log-dhcp'
+        echo "dhcp-leasefile=$DHCP_SERVER_LEASES"
+        echo "pid-file=$DHCP_SERVER_PID"
+        local f iface start end mask gw dns lease
+        while IFS= read -r f; do
+            [[ -r "$f" ]] || continue
+            # shellcheck disable=SC1090
+            source "$f"
+            iface_exists "$iface"
+            printf 'interface=%s\n' "$iface"
+            printf 'dhcp-range=%s,%s,%s,%s\n' "$start" "$end" "$mask" "$lease"
+            printf 'dhcp-option=%s,3,%s\n' "$iface" "$gw"
+            [[ -n "$dns" ]] && printf 'dhcp-option=%s,6,%s\n' "$iface" "$dns"
+        done < <(find "$DHCP_SERVER_INTENT_DIR" -maxdepth 1 -type f -name '*.conf' -print 2>/dev/null | sort)
+    } >"$tmp"
+    sudo_if_needed cp "$tmp" "$DHCP_SERVER_CONF"
+    rm -f "$tmp"
+}
+
+dhcp_server_running(){
+    [[ -r "$DHCP_SERVER_PID" ]] || return 1
+    local pid cmdline
+    pid="$(cat "$DHCP_SERVER_PID" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+    # dnsmasq drops privileges (normally to nobody).  A non-root lab user
+    # cannot reliably use `kill -0` against that process, even when it is
+    # healthy.  ps can test process existence without requiring signal
+    # permission.  Also verify that the PID still belongs to our dnsmasq.
+    ps -p "$pid" >/dev/null 2>&1 || return 1
+    cmdline="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    [[ "$cmdline" == *dnsmasq* && "$cmdline" == *"$DHCP_SERVER_CONF"* ]]
+}
+
+dhcp_server_stop_impl(){
+    if dhcp_server_running; then
+        sudo_if_needed kill "$(cat "$DHCP_SERVER_PID")" 2>/dev/null || true
+        for _ in {1..20}; do dhcp_server_running || break; sleep 0.1; done
+    fi
+    sudo_if_needed rm -f "$DHCP_SERVER_PID" 2>/dev/null || true
+}
+
+dhcp_server_start_impl(){
+    command -v dnsmasq >/dev/null 2>&1 || die "dnsmasq is not installed."
+    compgen -G "$DHCP_SERVER_INTENT_DIR/*.conf" >/dev/null || die "No DHCP pools configured. Use dhcp-pool-create first."
+    dhcp_server_build_conf
+    sudo_if_needed dnsmasq --test --conf-file="$DHCP_SERVER_CONF" >/dev/null
+    dhcp_server_stop_impl
+    sudo_if_needed dnsmasq --conf-file="$DHCP_SERVER_CONF"
+    sleep 0.2
+    dhcp_server_running || die "dnsmasq did not remain running."
+    echo "DHCP server started with $(find "$DHCP_SERVER_INTENT_DIR" -maxdepth 1 -type f -name '*.conf' | wc -l) pool(s)."
+}
+
+usage(){ cat <<'EOF'
+labhost helper commands
+
+General:     lab-help | lab-status | lab-reset | lab-save | lab-config | lab-readme
+VRF:         vrf-create vrf-delete vrf-add vrf-remove vrf-status
+             vrf-route-add vrf-route-del vrf-exec mgmt-vrf-status
+LAG:         lag-create lag-status lag-delete lag-member-up lag-member-down
+VLAN/QinQ:   vlan-create vlan-delete vlan-list qinq-create qinq-delete
+Interfaces:  ip-set ipv6-set mac-set mtu-set mtu-all route-add route-del default-gw
+             link-up link-down link-flap
+Path/ports:  path-test port-test ports-scan
+Capture:     capture capture-save capture-ring capture-read
+             capture-lacp capture-igmp capture-pim capture-arp capture-nd
+NetEm/WAN:   netem netem-clear netem-status netem-profile rate-limit rate-clear
+             wan-create wan-impair wan-status wan-delete
+iperf:       iperf-server iperf-client iperf-udp iperf-reverse iperf-bidir
+             iperf-parallel iperf-bind iperf-mcast-server iperf-mcast-send iperf-test
+Multicast:   mcast-join mcast-send
+Services:    http-server https-server tcp-listen udp-listen dnsmasq-start dnsmasq-stop
+             dhcp-pool-create dhcp-pool-delete dhcp-pool-list dhcp-server-start
+             dhcp-server-stop dhcp-server-status tftp-server lldp-start lldp-show lldp-stop radius-test snmp-walk snmp-get
+ARP/ND:      arp-watch nd-watch gratuitous-arp arp-clear
+Clients:     clients-create clients-list clients-delete clients-status clients-arp
+             clients-ping clients-traffic endpoint-move
+PC/Phone:    pc-phone-create pc-phone-delete pc-phone-status pc-phone-reprovision
+             pc-phones-create pc-phones-status
+Traffic:     send-tcp send-udp send-broadcast send-mcast
+
+Help:
+  lab-help <command>
+  <command> --help
+  <command> -h
+
+Full guide:
+  lab-readme
+EOF
+}
+
+help_command(){
+    local c="${1:-}"
+    case "$c" in
+      lab-status) cat <<'EOF'
+Usage: lab-status
+Shows host, interfaces, addresses, routes, neighbors, VRFs, bonds, VLANs,
+qdiscs/NetEm, listening ports, and help/documentation hints.
+EOF
+      ;;
+      lab-reset) cat <<'EOF'
+Usage: lab-reset
+Conservatively removes helper-created/test state while preserving eth0 and vrf-mgmt.
+EOF
+      ;;
+      lab-save) cat <<'EOF'
+Usage:
+  lab-save
+  lab-save --dry-run
+
+Inspects current supported Linux network state and generates:
+  /config/<hostname>.sh
+
+--dry-run prints the generated startup script without writing it.
+If a startup file already exists, lab-save creates <hostname>.sh.bak first.
+
+Automatically captured where reconstructable:
+  IPv4/IPv6 addresses, main-table routes, VLANs/QinQ, bonds/LAGs,
+  user VRFs and VRF routes, non-default MTUs, NetEm qdiscs.
+
+The automatic vrf-mgmt/table 4094 is recreated by the entrypoint and is not saved.
+EOF
+      ;;
+      lab-config) cat <<'EOF'
+Usage:
+  lab-config
+  lab-config edit
+  lab-config path
+
+lab-config       display current startup script
+lab-config edit  edit it using $EDITOR, nano, or vi
+lab-config path  print its pathname
+EOF
+      ;;
+      lab-readme) echo "Usage: lab-readme   # opens the full in-container README" ;;
+      mgmt-vrf-status) cat <<'EOF'
+Usage: mgmt-vrf-status
+Shows vrf-mgmt/table 4094, eth0 addressing/routes, and tcp_l3mdev_accept.
+EOF
+      ;;
+      vrf-create) cat <<'EOF'
+Usage: vrf-create <name> <table-id>
+Examples:
+  vrf-create blue 101
+  vrf-create red 102
+Note: table 4094 is reserved for vrf-mgmt.
+EOF
+      ;;
+      vrf-delete) echo "Usage: vrf-delete <name>" ;;
+      vrf-add) cat <<'EOF'
+Usage: vrf-add <name> <interface>
+Example:
+  vrf-add blue eth1.100
+EOF
+      ;;
+      vrf-remove) echo "Usage: vrf-remove <interface>" ;;
+      vrf-status) echo "Usage: vrf-status [name]" ;;
+      vrf-route-add) cat <<'EOF'
+Usage: vrf-route-add <name> <prefix|default> <gateway> [interface]
+Examples:
+  vrf-route-add blue default 10.1.0.1
+  vrf-route-add blue 10.50.0.0/16 10.1.0.1 eth1.100
+EOF
+      ;;
+      vrf-route-del) echo "Usage: vrf-route-del <name> <prefix|default>" ;;
+      vrf-exec) cat <<'EOF'
+Usage: vrf-exec <name> <command> [args...]
+Examples:
+  vrf-exec blue ping 8.8.8.8
+  vrf-exec red iperf3 -c 10.60.0.10
+EOF
+      ;;
+      lag-create) cat <<'EOF'
+Usage: lag-create <member1> <member2> [bond] [mode]
+Defaults: bond=bond0, mode=802.3ad, LACP active/fast, miimon=100ms
+Examples:
+  lag-create eth1 eth2
+  lag-create eth1 eth2 bond10
+  lag-create eth1 eth2 bond0 active-backup
+EOF
+      ;;
+      lag-status) echo "Usage: lag-status [bond]   # default bond0" ;;
+      lag-delete) echo "Usage: lag-delete [bond]   # default bond0" ;;
+      lag-member-up|lag-member-down) echo "Usage: $c <member-interface>" ;;
+      vlan-create) cat <<'EOF'
+Usage: vlan-create <parent> <vlan-id> [ip/prefix|dhcp]
+Examples:
+  vlan-create eth1 100
+  vlan-create eth1 100 10.100.0.10/24
+  vlan-create eth1 100 dhcp
+  vlan-create bond0 200 10.200.0.10/24
+EOF
+      ;;
+      vlan-delete) echo "Usage: vlan-delete <vlan-interface>" ;;
+      vlan-list) echo "Usage: vlan-list" ;;
+      qinq-create) cat <<'EOF'
+Usage: qinq-create <parent> <s-vlan> <c-vlan> [ip/prefix]
+Example: qinq-create eth1 100 200 10.20.0.10/24
+EOF
+      ;;
+      qinq-delete) echo "Usage: qinq-delete <inner-qinq-interface>" ;;
+      dhcp-pool-create) cat <<'EOF'
+Usage: dhcp-pool-create <interface> <start-ip> <end-ip> <netmask> <gateway> [dns-server] [lease-time]
+
+Create or replace a persistent DHCP pool served by labhost dnsmasq.
+The interface must already exist and normally needs a static IP in the pool subnet.
+Defaults: dns-server=<gateway>, lease-time=1h.
+
+Example:
+  dhcp-pool-create eth10.100 192.168.100.100 192.168.100.199 255.255.255.0 192.168.100.1
+  dhcp-pool-create eth10.200 192.168.200.100 192.168.200.199 255.255.255.0 192.168.200.1 192.168.200.53 8h
+EOF
+        ;;
+      dhcp-pool-delete) echo "Usage: dhcp-pool-delete <interface>" ;;
+      dhcp-pool-list) echo "Usage: dhcp-pool-list" ;;
+      dhcp-server-start) cat <<'EOF'
+Usage: dhcp-server-start
+
+Start/reload the persistent labhost DHCP service using all configured pools.
+The service runs in the background and is reconstructed by lab-save.
+EOF
+        ;;
+      dhcp-server-stop) echo "Usage: dhcp-server-stop" ;;
+      dhcp-server-status) echo "Usage: dhcp-server-status" ;;
+      ip-set) cat <<'EOF'
+Usage:
+  ip-set <interface> <ip/prefix> [default-gateway]
+  ip-set <interface> dhcp
+
+DHCP mode obtains IPv4 address/router information without replacing the
+container's management DNS configuration. lab-save preserves DHCP as intent
+rather than freezing the current lease into the startup script.
+EOF
+      ;;
+      ipv6-set) echo "Usage: ipv6-set <interface> <ipv6/prefix> [default-gateway]" ;;
+      mac-set) echo "Usage: mac-set <interface> <mac-address>" ;;
+      mtu-set) echo "Usage: mtu-set <interface> <mtu>   # e.g. mtu-set eth1 9000" ;;
+      mtu-all) cat <<'EOF'
+Usage: mtu-all <mtu>
+Sets the MTU on every lab-facing interface while preserving lo, eth0, and vrf-mgmt.
+Derived interfaces (VLAN/macvlan) are handled in a safe parent/child order.
+Example: mtu-all 9000
+EOF
+      ;;
+      route-add) echo "Usage: route-add <prefix> <gateway> [interface]" ;;
+      route-del) echo "Usage: route-del <prefix>" ;;
+      default-gw) echo "Usage: default-gw <gateway> [interface]" ;;
+      link-up|link-down) echo "Usage: $c <interface>" ;;
+      link-flap) echo "Usage: link-flap <interface> [seconds]   # default 5" ;;
+      path-test) echo "Usage: path-test <destination>   # route, ping, traceroute, MTR, neighbors" ;;
+      port-test) echo "Usage: port-test <host> <port>" ;;
+      ports-scan) echo "Usage: ports-scan <host>" ;;
+      capture) echo "Usage: capture <interface> [tcpdump-filter...]" ;;
+      capture-save) echo "Usage: capture-save <interface> <file.pcap> [filter...]   # saves under /pcaps by default" ;;
+      capture-ring) echo "Usage: capture-ring <interface> <file.pcap> [size-MB] [count] [filter...]   # defaults 100MB x5" ;;
+      capture-read) echo "Usage: capture-read <file.pcap> [filter...]" ;;
+      capture-lacp|capture-igmp|capture-pim|capture-arp|capture-nd) echo "Usage: $c <interface>" ;;
+      netem) cat <<'EOF'
+Usage: netem <interface> <options...>
+Common options:
+  delay <time> [jitter]
+  loss <percent>
+  reorder <percent>
+  duplicate <percent>
+  corrupt <percent>
+Examples:
+  netem eth1 delay 50ms
+  netem eth1 delay 50ms 10ms loss 1%
+  netem eth1 delay 40ms 10ms loss 0.5% reorder 2%
+Advanced: man tc-netem
+EOF
+      ;;
+      netem-clear|netem-status|rate-clear) echo "Usage: $c <interface>" ;;
+      netem-profile) echo "Usage: netem-profile <interface> <wan|bad-wan|satellite|lossy|mobile|clean>" ;;
+      rate-limit) echo "Usage: rate-limit <interface> <rate>   # e.g. 100mbit, 1gbit" ;;
+      wan-create) echo "Usage: wan-create <interface1> <interface2> [bridge]   # default br-wan" ;;
+      wan-impair) cat <<'EOF'
+Usage: wan-impair <interface> <netem-options...>
+Likely options: delay, jitter, loss, reorder, duplicate, corrupt
+Example: wan-impair eth1 delay 50ms 10ms loss 1%
+EOF
+      ;;
+      wan-status|wan-delete) echo "Usage: $c [bridge]   # default br-wan" ;;
+      iperf-server) echo "Usage: iperf-server [port]   # default 5201" ;;
+      iperf-client) echo "Usage: iperf-client <server> [seconds]   # default 10" ;;
+      iperf-udp) echo "Usage: iperf-udp <server> <rate> [seconds]   # e.g. 500M" ;;
+      iperf-reverse|iperf-bidir) echo "Usage: $c <server> [seconds]" ;;
+      iperf-parallel) echo "Usage: iperf-parallel <server> <streams> [seconds]" ;;
+      iperf-bind) echo "Usage: iperf-bind <source-ip> <server> [seconds]" ;;
+      iperf-mcast-server) echo "Usage: iperf-mcast-server <group> [port]   # default 5001" ;;
+      iperf-mcast-send) echo "Usage: iperf-mcast-send <group> <rate> [seconds] [ttl]   # TTL default 32" ;;
+      iperf-test) echo "Usage: iperf-test <server>   # short TCP forward/reverse/4-stream + UDP suite" ;;
+      mcast-join) echo "Usage: mcast-join <interface> <group> [source]" ;;
+      mcast-send) echo "Usage: mcast-send <interface> <group> [ttl]   # TTL default 32" ;;
+      http-server) echo "Usage: http-server [port] [directory]   # defaults 8080 /tmp" ;;
+      https-server) echo "Usage: https-server [port] [directory]   # defaults 8443 /tmp" ;;
+      tcp-listen|udp-listen) echo "Usage: $c <port>" ;;
+      dnsmasq-start) echo "Usage: dnsmasq-start [interface]" ;;
+      dnsmasq-stop) echo "Usage: dnsmasq-stop" ;;
+      tftp-server) echo "Usage: tftp-server [directory]   # default /tmp/tftp" ;;
+      lldp-start|lldp-show|lldp-stop) echo "Usage: $c" ;;
+      radius-test) echo "Usage: radius-test <server> <user> <password> <shared-secret>" ;;
+      snmp-walk) echo "Usage: snmp-walk <host> [community] [oid]   # defaults public / 1.3.6.1.2.1" ;;
+      snmp-get) echo "Usage: snmp-get <host> <oid> [community]   # default public" ;;
+      arp-watch|nd-watch) echo "Usage: $c <interface>" ;;
+      gratuitous-arp) echo "Usage: gratuitous-arp <interface> <ip>" ;;
+      arp-clear) echo "Usage: arp-clear [interface]" ;;
+      pc-phone-create) cat <<'EOF'
+Usage: pc-phone-create <parent> [--no-dhcp]
+Create one simulated PC-behind-phone endpoint on a switch-facing interface.
+The PC uses a deterministic native/untagged MAC. The phone sends LLDP-MED
+with its own deterministic MAC, learns the switch Voice Network Policy, then
+creates tagged voice traffic with the same phone MAC. DHCP is default.
+EOF
+        ;;
+      pc-phone-delete) echo "Usage: pc-phone-delete <parent>" ;;
+      pc-phone-status) echo "Usage: pc-phone-status [parent]" ;;
+      pc-phones-create) cat <<'EOF'
+Usage: pc-phones-create --all [--no-dhcp]
+       pc-phones-create <parent> [parent ...] [--no-dhcp]
+Create simulated PC-behind-phone endpoints in bulk. --all selects physical
+Containerlab dataplane interfaces named eth1, eth2, ... and always excludes
+eth0/the management interface. Existing PC/phone objects are left unchanged.
+EOF
+        ;;
+      pc-phones-status) echo "Usage: pc-phones-status [parent]" ;;
+      pc-phone-reprovision) echo "Usage: pc-phone-reprovision <parent>" ;;
+      clients-create) cat <<'EOF'
+Usage: clients-create <parent> <count> <subnet/prefix> [start]
+start may be a host offset or a literal starting IPv4 address.
+Examples:
+  clients-create eth1 10 192.168.1.0/24
+  clients-create eth1 10 192.168.1.0/24 100
+  clients-create eth1 10 192.168.1.0/24 192.168.1.100
+EOF
+      ;;
+      clients-list|clients-delete|clients-status|clients-arp) echo "Usage: $c" ;;
+      clients-ping) echo "Usage: clients-ping <destination> [count]" ;;
+      clients-traffic) echo "Usage: clients-traffic <destination> <port> [interval]   # runs until Ctrl-C" ;;
+      endpoint-move) echo "Usage: endpoint-move <old-interface> <new-interface> <ip/prefix> <mac>" ;;
+      send-tcp) cat <<'EOF'
+Usage: send-tcp <destination> <port> [message] [--count N] [--interval SEC] [--source IP]
+Examples:
+  send-tcp 10.1.1.20 5000 "hello"
+  send-tcp 10.1.1.20 5000 "test" --count 10 --interval 1
+If stdin is piped and message is omitted, stdin is sent.
+EOF
+      ;;
+      send-udp) echo "Usage: send-udp <destination> <port> [message]" ;;
+      send-broadcast) echo "Usage: send-broadcast <interface> <port> [message]" ;;
+      send-mcast) echo "Usage: send-mcast <interface> <group> <port> [message]   # TTL 32" ;;
+      *) echo "No detailed help found for: $c"; return 1 ;;
+    esac
+}
+
+emit_header(){
+cat <<EOF
+#!/bin/bash
+set -e
+
+# Generated by lab-save on $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+# Host: $(hostname -s)
+# Edit freely. This is an ordinary shell startup script.
+# $MGMT_VRF / table $MGMT_TABLE is recreated automatically by the entrypoint.
+
+EOF
+}
+
+emit_vrfs(){
+    local dev table
+    while read -r dev; do
+        [[ -n "$dev" ]] || continue
+        [[ "$dev" == "$MGMT_VRF" ]] && continue
+        table="$(vrf_table "$dev")"
+        [[ -n "$table" ]] && printf 'vrf-create %q %q\n' "${dev#vrf-}" "$table"
+    done < <(ip -o link show type vrf 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}' | cut -d@ -f1)
+    echo
+}
+
+emit_bonds(){
+    local f bond mode
+    if compgen -G '/proc/net/bonding/*' >/dev/null; then
+        for f in /proc/net/bonding/*; do
+            bond="${f##*/}"
+            mode="$(awk -F': ' '/Bonding Mode/ {print $2; exit}' "$f")"
+            case "$mode" in
+                *"IEEE 802.3ad"*) mode="802.3ad" ;;
+                *"active-backup"*) mode="active-backup" ;;
+                *"balance-xor"*) mode="balance-xor" ;;
+                *"broadcast"*) mode="broadcast" ;;
+                *"balance-tlb"*) mode="balance-tlb" ;;
+                *"balance-alb"*) mode="balance-alb" ;;
+                *) mode="802.3ad" ;;
+            esac
+            mapfile -t members < <(awk -F': ' '/Slave Interface/ {print $2}' "$f")
+            if [[ ${#members[@]} -ge 2 ]]; then
+                printf 'lag-create %q %q %q %q\n' "${members[0]}" "${members[1]}" "$bond" "$mode"
+                if [[ ${#members[@]} -gt 2 ]]; then
+                    printf '# NOTE: additional bond members require manual restore: %s\n' "${members[*]:2}"
+                fi
+            fi
+        done
+        echo
+    fi
+}
+
+emit_vlans(){
+    local name parent vid proto child cvid
+    while read -r name parent; do
+        name="${name%@*}"; parent="${parent%@*}"
+        [[ -n "$name" && -n "$parent" ]] || continue
+        [[ "$name" == pp-* ]] && continue
+        vid="$(ip -d link show "$name" | sed -nE 's/.* vlan protocol [^ ]+ id ([0-9]+).*/\1/p' | head -1)"
+        proto="$(ip -d link show "$name" | sed -nE 's/.* vlan protocol ([^ ]+) id .*/\1/p' | head -1)"
+        [[ -n "$vid" ]] || continue
+
+        # Inner QinQ interfaces get recreated when their outer 802.1ad parent is handled.
+        if [[ "$parent" == *.* && "$proto" == "802.1Q" ]]; then
+            continue
+        fi
+
+        if [[ "$proto" == "802.1ad" ]]; then
+            child="$(ip -o link show | awk -F': ' -v p="$name" '$2 ~ ("@"p"$") {gsub(/^ +| +$/,"",$2); print $2; exit}')"
+            child="${child%@*}"
+            if [[ -n "$child" ]]; then
+                cvid="$(ip -d link show "$child" | sed -nE 's/.* vlan protocol [^ ]+ id ([0-9]+).*/\1/p' | head -1)"
+                if [[ -n "$cvid" ]]; then
+                    printf 'qinq-create %q %q %q\n' "$parent" "$vid" "$cvid"
+                    continue
+                fi
+            fi
+        fi
+        if is_dhcp_intent "$name"; then
+            printf 'vlan-create %q %q dhcp\n' "$parent" "$vid"
+        else
+            printf 'vlan-create %q %q\n' "$parent" "$vid"
+        fi
+    done < <(ip -o link show type vlan 2>/dev/null | awk -F': ' '{gsub(/^ +| +$/,"",$2); split($2,a,"@"); print a[1],a[2]}')
+    echo
+}
+
+emit_vrf_membership() {
+    local dev master
+
+    while read -r dev; do
+        dev="${dev%@*}"
+
+        [[ -n "$dev" ]] || continue
+        [[ "$dev" == "lo" ]] && continue
+        [[ "$dev" == "$MGMT_IF" ]] && continue
+        [[ "$dev" == "$MGMT_VRF" ]] && continue
+
+        master="$(
+            ip -d link show "$dev" 2>/dev/null |
+            sed -nE 's/.* master ([^ ]+).*/\1/p' |
+            head -1
+        )"
+
+        [[ -n "$master" ]] || continue
+        [[ "$master" == "$MGMT_VRF" ]] && continue
+        [[ "$master" == vrf-* ]] || continue
+
+        printf 'vrf-add %q %q\n' \
+            "${master#vrf-}" \
+            "$dev"
+
+    done < <(
+        ip -o link show |
+        awk -F': ' '{print $2}' |
+        cut -d@ -f1
+    )
+
+    echo
+}
+
+emit_mtu_all(){
+    if [[ -r "$MTU_ALL_INTENT" ]]; then
+        local mtu
+        mtu="$(head -1 "$MTU_ALL_INTENT" | tr -d '[:space:]')"
+        [[ "$mtu" =~ ^[0-9]+$ ]] && printf 'mtu-all %q\n\n' "$mtu"
+    fi
+}
+
+emit_dhcp_server(){
+    local f iface start end mask gw dns lease
+    [[ -d "$DHCP_SERVER_INTENT_DIR" ]] || { echo; return; }
+    while IFS= read -r f; do
+        [[ -r "$f" ]] || continue
+        # shellcheck disable=SC1090
+        source "$f"
+        printf 'dhcp-pool-create %q %q %q %q %q %q %q\n' "$iface" "$start" "$end" "$mask" "$gw" "$dns" "$lease"
+    done < <(find "$DHCP_SERVER_INTENT_DIR" -maxdepth 1 -type f -name '*.conf' -print 2>/dev/null | sort)
+    if [[ -r "$DHCP_SERVER_INTENT_DIR/.enabled" ]]; then
+        echo 'dhcp-server-start'
+    fi
+    echo
+}
+
+emit_clients(){
+    local f
+    if [[ -d "$CLIENT_INTENT_DIR" ]]; then
+        while IFS= read -r f; do
+            [[ -r "$f" ]] || continue
+            cat "$f"
+        done < <(find "$CLIENT_INTENT_DIR" -maxdepth 1 -type f -name 'cl*-cl*.conf' -print 2>/dev/null | sort)
+    fi
+    echo
+}
+
+emit_mtu() {
+    local dev mtu
+
+    while read -r dev; do
+        dev="${dev%@*}"
+
+        [[ -n "$dev" ]] || continue
+        [[ "$dev" == "lo" ]] && continue
+        [[ "$dev" == "$MGMT_IF" ]] && continue
+        [[ "$dev" == "$MGMT_VRF" ]] && continue
+        [[ "$dev" == pp-* ]] && continue
+
+        mtu="$(
+            ip -o link show "$dev" |
+            awk '{
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "mtu") {
+                        print $(i + 1)
+                        exit
+                    }
+                }
+            }'
+        )"
+
+        [[ -n "$mtu" ]] || continue
+
+        #
+        # Labhost dataplane interfaces default to DEFAULT_DATA_MTU
+        # (9000 unless overridden with LABHOST_DATA_MTU).
+        # Only persist values that differ from that default.
+        #
+        baseline="$DEFAULT_DATA_MTU"
+        if [[ -r "$MTU_ALL_INTENT" ]]; then
+            saved_all="$(head -1 "$MTU_ALL_INTENT" | tr -d '[:space:]')"
+            [[ "$saved_all" =~ ^[0-9]+$ ]] && baseline="$saved_all"
+        fi
+
+        if [[ "$mtu" != "$baseline" ]]; then
+            printf 'mtu-set %q %q\n' \
+                "$dev" \
+                "$mtu"
+        fi
+
+    done < <(
+        ip -o link show |
+        awk -F': ' '{print $2}' |
+        cut -d@ -f1
+    )
+
+    echo
+}
+
+emit_addresses(){
+    local family line dev addr
+    for family in -4 -6; do
+        while read -r line; do
+            dev="$(awk '{print $2}' <<<"$line" | cut -d@ -f1)"
+            addr="$(awk '{print $4}' <<<"$line")"
+            [[ -n "$dev" && -n "$addr" ]] || continue
+            [[ "$dev" == "lo" || "$dev" == "$MGMT_IF" || "$dev" == "$MGMT_VRF" ]] && continue
+
+	    #
+            # Synthetic clients are recreated by clients-create.
+            # Do not save their addresses as standalone interfaces.
+            #
+            if [[ "$dev" =~ ^cl[0-9]+$ || "$dev" == pp-* ]]; then
+                continue
+            fi
+            # A DHCP lease is runtime state. Preserve the high-level DHCP
+            # request instead of freezing the current address into startup.
+            if [[ "$family" == "-4" ]] && is_dhcp_intent "$dev"; then
+                continue
+            fi
+            if [[ "$family" == "-4" ]]; then
+                printf 'ip-set %q %q\n' "$dev" "$addr"
+            else
+                [[ "$addr" == fe80:* ]] && continue
+                printf 'ipv6-set %q %q\n' "$dev" "$addr"
+            fi
+        done < <(ip -o "$family" addr show scope global 2>/dev/null || true)
+    done
+    echo
+}
+
+emit_dhcp_interfaces(){
+    local f dev
+    [[ -d "$DHCP_INTENT_DIR" ]] || { echo; return; }
+    while IFS= read -r f; do
+        [[ -r "$f" ]] || continue
+        dev="${f##*/}"
+        [[ -n "$dev" ]] || continue
+        [[ "$dev" == pp-* ]] && continue
+        # VLAN DHCP is emitted directly by emit_vlans as
+        # 'vlan-create <parent> <vid> dhcp'.
+        if ip -d link show "$dev" 2>/dev/null | grep -q ' vlan protocol '; then
+            continue
+        fi
+        [[ "$dev" == "$MGMT_IF" || "$dev" == "$MGMT_VRF" ]] && continue
+        ip link show "$dev" >/dev/null 2>&1 || continue
+        printf 'ip-set %q dhcp\n' "$dev"
+    done < <(find "$DHCP_INTENT_DIR" -maxdepth 1 -type f -print 2>/dev/null | sort)
+    echo
+}
+
+emit_routes(){
+    local line prefix gw dev
+    while read -r line; do
+        [[ -n "$line" ]] || continue
+        [[ "$line" == *"proto kernel"* || "$line" == *"proto dhcp"* || "$line" == *"dev $MGMT_IF"* ]] && continue
+        prefix="$(awk '{print $1}' <<<"$line")"
+        gw="$(awk '/ via / {for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$line")"
+        dev="$(awk '/ dev / {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$line")"
+        [[ -n "$gw" ]] || continue
+        [[ -n "$dev" ]] && is_dhcp_intent "$dev" && continue
+        if [[ "$prefix" == "default" ]]; then
+            [[ -n "$dev" ]] && printf 'default-gw %q %q\n' "$gw" "$dev" || printf 'default-gw %q\n' "$gw"
+        else
+            [[ -n "$dev" ]] && printf 'route-add %q %q %q\n' "$prefix" "$gw" "$dev" || printf 'route-add %q %q\n' "$prefix" "$gw"
+        fi
+    done < <(ip -4 route show table main)
+    echo
+}
+
+emit_vrf_routes(){
+    local vrf table line prefix gw dev
+    while read -r vrf; do
+        [[ -n "$vrf" && "$vrf" != "$MGMT_VRF" ]] || continue
+        table="$(vrf_table "$vrf")"; [[ -n "$table" ]] || continue
+        while read -r line; do
+            [[ -n "$line" ]] || continue
+            [[ "$line" == *"proto kernel"* || "$line" == *"proto static metric 4278198272"* ]] && continue
+            prefix="$(awk '{print $1}' <<<"$line")"
+            gw="$(awk '/ via / {for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$line")"
+            dev="$(awk '/ dev / {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$line")"
+            [[ -n "$gw" ]] || continue
+            printf 'vrf-route-add %q %q %q' "${vrf#vrf-}" "$prefix" "$gw"
+            [[ -n "$dev" ]] && printf ' %q' "$dev"
+            printf '\n'
+        done < <(ip -4 route show table "$table")
+        echo
+    done < <(ip -o link show type vrf 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}' | cut -d@ -f1)
+}
+
+emit_pc_phones(){
+    local f
+    [[ -d "$PC_PHONE_INTENT_DIR" ]] || { echo; return; }
+    while IFS= read -r f; do
+        [[ -r "$f" ]] || continue
+        cat "$f"
+    done < <(find "$PC_PHONE_INTENT_DIR" -maxdepth 1 -type f -name '*.conf' -print 2>/dev/null | sort)
+    echo
+}
+
+emit_qdiscs() {
+    local dev line args
+
+    while read -r dev; do
+        dev="${dev%@*}"
+
+        [[ -n "$dev" ]] || continue
+        [[ "$dev" == "lo" ]] && continue
+        [[ "$dev" == "$MGMT_IF" ]] && continue
+        [[ "$dev" == "$MGMT_VRF" ]] && continue
+
+        line="$(
+            tc qdisc show dev "$dev" 2>/dev/null |
+            head -1
+        )"
+
+        [[ -n "$line" ]] || continue
+
+        if [[ "$line" == *" netem "* ]]; then
+            args="$(
+                sed -E \
+                    's/^qdisc netem [^ ]+ dev [^ ]+ root( refcnt [0-9]+)? ?//' \
+                    <<<"$line"
+            )"
+
+            if [[ -n "$args" ]]; then
+                printf 'netem %q %s\n' \
+                    "$dev" \
+                    "$args"
+            fi
+
+        elif [[ "$line" == *" tbf "* ]]; then
+            #
+            # tc's TBF display is not guaranteed to round-trip
+            # perfectly, so preserve it as a reminder rather than
+            # generating potentially incorrect startup syntax.
+            #
+            printf \
+                '# NOTE: TBF on %s needs manual verification: %s\n' \
+                "$dev" \
+                "$line"
+        fi
+
+    done < <(
+        ip -o link show |
+        awk -F': ' '{print $2}' |
+        cut -d@ -f1
+    )
+
+    echo
+}
+
+generate_startup(){
+    emit_header
+    emit_vrfs
+    emit_bonds
+    emit_vlans
+    emit_vrf_membership
+    emit_mtu_all
+    emit_mtu
+    emit_addresses
+    emit_dhcp_interfaces
+    emit_dhcp_server
+    emit_clients
+    emit_pc_phones
+    emit_routes
+    emit_vrf_routes
+    emit_qdiscs
+}
+
+case "$CMD" in
+lab-help)
+    if [[ -z "${1:-}" || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then usage; else help_command "$1"; fi
+    ;;
+lab-readme)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    exec less "$README_PATH"
+    ;;
+lab-status)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    echo "=== Host ==="; hostname
+    echo; echo "=== Interfaces ==="; ip -br link | strip_peer
+    echo; echo "=== Addresses ==="; ip -br addr | strip_peer
+    echo; echo "=== IPv4 routes (main) ==="; ip route
+    echo; echo "=== IPv6 routes (main) ==="; ip -6 route || true
+    echo; echo "=== Neighbors ==="; ip neigh || true
+    echo; echo "=== VRFs ==="; vrf-status || true
+    echo; echo "=== Bonds ==="
+    if compgen -G '/proc/net/bonding/*' >/dev/null; then for f in /proc/net/bonding/*; do echo "--- ${f##*/} ---"; cat "$f"; done; else echo none; fi
+    echo; echo "=== VLANs ==="; ip -d -o link show type vlan 2>/dev/null | strip_peer || true
+    echo; echo "=== qdisc / NetEm ==="; tc qdisc show
+    echo; echo "=== Listening ports ==="; ss -lntup || true
+    echo; echo "=== Help & Documentation ==="; echo "Commands:  lab-help"; echo "README:    lab-readme"
+    ;;
+mgmt-vrf-status)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    echo "VRF:       $MGMT_VRF"; echo "Table:     $MGMT_TABLE"; echo "Interface: $MGMT_IF"; echo
+    ip -br addr show "$MGMT_IF" | strip_peer || true
+    echo; ip route show table "$MGMT_TABLE" || true
+    echo; sysctl net.ipv4.tcp_l3mdev_accept
+    ;;
+vrf-create)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"
+    name="$1"; table="$2"; [[ "$table" == "$MGMT_TABLE" ]] && die "Table $MGMT_TABLE is reserved for $MGMT_VRF."
+    dev="$(vrf_dev "$name")"; ip link show "$dev" >/dev/null 2>&1 && die "$dev already exists."
+    sudo_if_needed ip link add "$dev" type vrf table "$table"; sudo_if_needed ip link set "$dev" up
+    ;;
+vrf-delete)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"
+    dev="$(vrf_dev "$1")"; [[ "$dev" == "$MGMT_VRF" ]] && die "Refusing to delete $MGMT_VRF."; iface_exists "$dev"
+    while read -r m; do [[ -n "$m" ]] && sudo_if_needed ip link set "$m" nomaster || true; done < <(ip -o link show master "$dev" 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1)
+    sudo_if_needed ip link del "$dev"
+    ;;
+vrf-add)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"
+    dev="$(vrf_dev "$1")"; iface="$2"; iface_exists "$dev"; iface_exists "$iface"
+    sudo_if_needed ip link set "$iface" master "$dev"; sudo_if_needed ip link set "$iface" up
+    ;;
+vrf-remove)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"
+    [[ "$1" == "$MGMT_IF" ]] && die "Refusing to detach management interface."; iface_exists "$1"
+    sudo_if_needed ip link set "$1" nomaster
+    ;;
+vrf-status)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    if [[ -n "${1:-}" ]]; then
+        dev="$(vrf_dev "$1")"; iface_exists "$dev"; table="$(vrf_table "$dev")"
+        echo "VRF: $dev"; echo "Table: $table"; echo "Interfaces:"
+        ip -o link show master "$dev" 2>/dev/null | awk -F': ' '{print "  "$2}' | strip_peer || true
+        echo "Routes:"; ip -4 route show table "$table" || true; ip -6 route show table "$table" || true
+    else
+        printf '%-16s %-8s %s\n' VRF TABLE INTERFACES
+        while read -r dev; do
+            [[ -n "$dev" ]] || continue
+            table="$(vrf_table "$dev")"
+            members="$(ip -o link show master "$dev" 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | paste -sd, -)"
+            printf '%-16s %-8s %s\n' "$dev" "${table:-?}" "${members:-none}"
+        done < <(ip -o link show type vrf 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}' | cut -d@ -f1)
+    fi
+    ;;
+vrf-route-add)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 3 "$@"
+    dev="$(vrf_dev "$1")"; prefix="$2"; gw="$3"; iface="${4:-}"; iface_exists "$dev"; table="$(vrf_table "$dev")"
+    if [[ -n "$iface" ]]; then
+        sudo_if_needed ip route replace table "$table" "$prefix" via "$gw" dev "$iface"
+    else
+        sudo_if_needed ip route replace table "$table" "$prefix" via "$gw"
+    fi
+    ;;
+vrf-route-del)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"
+    dev="$(vrf_dev "$1")"; iface_exists "$dev"; table="$(vrf_table "$dev")"; sudo_if_needed ip route del table "$table" "$2"
+    ;;
+vrf-exec)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"
+    dev="$(vrf_dev "$1")"; shift; iface_exists "$dev"; exec sudo ip vrf exec "$dev" "$@"
+    ;;
+lag-create)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"
+    m1="$1"; m2="$2"; bond="${3:-bond0}"; mode="${4:-802.3ad}"; iface_exists "$m1"; iface_exists "$m2"
+    sudo_if_needed ip link add "$bond" type bond mode "$mode" miimon 100
+    if [[ "$mode" == "802.3ad" ]]; then
+        sudo_if_needed ip link set "$bond" type bond lacp_active on lacp_rate fast
+    fi
+    sudo_if_needed ip link set "$m1" down; sudo_if_needed ip link set "$m2" down
+    sudo_if_needed ip link set "$m1" master "$bond"; sudo_if_needed ip link set "$m2" master "$bond"
+    sudo_if_needed ip link set "$m1" up; sudo_if_needed ip link set "$m2" up; sudo_if_needed ip link set "$bond" up
+    echo "Created $bond mode=$mode with members $m1 $m2"
+    ;;
+lag-status) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; bond="${1:-bond0}"; [[ -r "/proc/net/bonding/$bond" ]] && cat "/proc/net/bonding/$bond" || ip -d link show "$bond" ;;
+lag-delete)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; bond="${1:-bond0}"; iface_exists "$bond"
+    while read -r m; do [[ -n "$m" ]] && sudo_if_needed ip link set "$m" nomaster || true; done < <(ip -o link show master "$bond" | awk -F': ' '{print $2}' | cut -d@ -f1)
+    sudo_if_needed ip link del "$bond"
+    ;;
+lag-member-down|lag-member-up)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; iface_exists "$1"
+    if [[ "$CMD" == lag-member-down ]]; then
+        sudo_if_needed ip link set "$1" down
+    else
+        sudo_if_needed ip link set "$1" up
+    fi
+    ;;
+vlan-create)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"
+    parent="$1"; vid="$2"; addr="${3:-}"; iface_exists "$parent"; name="${parent}.${vid}"
+    [[ "$vid" =~ ^[0-9]+$ ]] || die "VLAN ID must be numeric."
+    (( vid >= 1 && vid <= 4094 )) || die "VLAN ID must be between 1 and 4094."
+    ip link show "$name" >/dev/null 2>&1 && die "Interface '$name' already exists."
+    sudo_if_needed ip link add link "$parent" name "$name" type vlan id "$vid"
+    sudo_if_needed ip link set "$name" up
+    if [[ "$addr" == "dhcp" ]]; then
+        mark_dhcp_intent "$name"
+        if ! dhcp_acquire "$name"; then
+            clear_dhcp_intent "$name"
+            sudo_if_needed ip link del "$name" 2>/dev/null || true
+            exit 1
+        fi
+    elif [[ -n "$addr" ]]; then
+        clear_dhcp_intent "$name"
+        sudo_if_needed ip addr add "$addr" dev "$name"
+    else
+        clear_dhcp_intent "$name"
+    fi
+    echo "$name created"
+    ;;
+vlan-delete)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"
+    iface_exists "$1"
+    is_dhcp_intent "$1" && dhcp_stop_iface "$1" || true
+    clear_dhcp_intent "$1"
+    sudo_if_needed ip link del "$1"
+    ;;
+vlan-list) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; ip -d -o link show type vlan | strip_peer || true ;;
+qinq-create)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 3 "$@"
+    parent="$1"; svid="$2"; cvid="$3"; addr="${4:-}"; iface_exists "$parent"; outer="${parent}.${svid}"; inner="${outer}.${cvid}"
+    sudo_if_needed ip link add link "$parent" name "$outer" type vlan protocol 802.1ad id "$svid"; sudo_if_needed ip link set "$outer" up
+    sudo_if_needed ip link add link "$outer" name "$inner" type vlan protocol 802.1Q id "$cvid"; sudo_if_needed ip link set "$inner" up
+    if [[ -n "$addr" ]]; then
+        sudo_if_needed ip addr add "$addr" dev "$inner"
+    fi
+    echo "$inner created (S=$svid C=$cvid)"
+    ;;
+qinq-delete) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; inner="$1"; outer="${inner%.*}"; sudo_if_needed ip link del "$inner" 2>/dev/null || true; sudo_if_needed ip link del "$outer" 2>/dev/null || true ;;
+ip-set)
+    want_help "${1:-}" && {
+        help_command "$CMD"
+        exit 0
+    }
+
+    require_args "$CMD" 2 "$@"
+
+    i="$1"
+    a="$2"
+    g="${3:-}"
+
+    iface_exists "$i"
+
+    if [[ "$a" == "dhcp" ]]; then
+        [[ -z "$g" ]] || die "Do not specify a gateway with 'ip-set <interface> dhcp'; DHCP supplies it."
+        mark_dhcp_intent "$i"
+        if ! dhcp_acquire "$i"; then
+            clear_dhcp_intent "$i"
+            exit 1
+        fi
+    else
+        if is_dhcp_intent "$i"; then
+            dhcp_stop_iface "$i"
+            sudo_if_needed ip -4 addr flush dev "$i" scope global 2>/dev/null || true
+        fi
+        clear_dhcp_intent "$i"
+        sudo_if_needed ip addr replace "$a" dev "$i"
+        sudo_if_needed ip link set "$i" up
+
+        if [[ -n "$g" ]]; then
+            sudo_if_needed ip route replace default via "$g" dev "$i"
+        fi
+    fi
+    ;;
+ipv6-set)
+    want_help "${1:-}" && {
+        help_command "$CMD"
+        exit 0
+    }
+
+    require_args "$CMD" 2 "$@"
+
+    i="$1"
+    a="$2"
+    g="${3:-}"
+
+    iface_exists "$i"
+
+    sudo_if_needed ip -6 addr replace "$a" dev "$i"
+    sudo_if_needed ip link set "$i" up
+
+    if [[ -n "$g" ]]; then
+        sudo_if_needed ip -6 route replace default via "$g" dev "$i"
+    fi
+    ;;
+mac-set) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; i="$1"; iface_exists "$i"; sudo_if_needed ip link set "$i" down; sudo_if_needed ip link set "$i" address "$2"; sudo_if_needed ip link set "$i" up ;;
+mtu-set) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; iface_exists "$1"; sudo_if_needed ip link set "$1" mtu "$2" ;;
+mtu-all)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"
+    new_mtu="$1"; [[ "$new_mtu" =~ ^[0-9]+$ ]] || die "MTU must be numeric"
+    (( new_mtu >= 576 && new_mtu <= 65535 )) || die "MTU must be between 576 and 65535"
+
+    mapfile -t mtu_ifaces < <(python3 - "$MGMT_IF" "$MGMT_VRF" <<'PY'
+import os, sys
+exclude={"lo",sys.argv[1],sys.argv[2]}
+base="/sys/class/net"
+items=[]; index_to_name={}
+for name in os.listdir(base):
+    try:
+        idx=int(open(f"{base}/{name}/ifindex").read())
+        link=int(open(f"{base}/{name}/iflink").read())
+    except Exception:
+        continue
+    index_to_name[idx]=name
+    items.append((name,idx,link))
+def depth(name, seen=None):
+    seen=set() if seen is None else seen
+    if name in seen: return 0
+    seen.add(name)
+    row=next((r for r in items if r[0]==name),None)
+    if not row: return 0
+    _,idx,link=row
+    parent=index_to_name.get(link)
+    if not parent or parent==name: return 0
+    return 1+depth(parent,seen)
+for name,_,_ in items:
+    if name not in exclude:
+        print(depth(name),name)
+PY
+    )
+
+    # Raising MTU requires parents first. Lowering requires children first.
+    raising=false
+    for row in "${mtu_ifaces[@]}"; do
+        dev="${row#* }"
+        cur="$(cat "/sys/class/net/$dev/mtu" 2>/dev/null || echo "$new_mtu")"
+        if (( new_mtu > cur )); then raising=true; break; fi
+    done
+    if $raising; then
+        mapfile -t ordered < <(printf '%s\n' "${mtu_ifaces[@]}" | sort -n -k1,1 -k2,2)
+    else
+        mapfile -t ordered < <(printf '%s\n' "${mtu_ifaces[@]}" | sort -rn -k1,1 -k2,2)
+    fi
+
+    changed=0
+    for row in "${ordered[@]}"; do
+        dev="${row#* }"
+        if sudo_if_needed ip link set "$dev" mtu "$new_mtu" 2>/dev/null; then
+            printf '%-16s MTU %s\n' "$dev" "$new_mtu"
+            changed=$((changed + 1))
+        else
+            echo "WARNING: Could not set MTU $new_mtu on $dev" >&2
+        fi
+    done
+    ensure_intent_dir
+    printf '%s\n' "$new_mtu" >"$MTU_ALL_INTENT"
+    echo "$changed dataplane interfaces updated; management interface $MGMT_IF was preserved."
+    ;;
+route-add)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    require_args "$CMD" 2 "$@"
+    p="$1"; g="$2"; i="${3:-}"
+    if [[ -n "$i" ]]; then
+        sudo_if_needed ip route replace "$p" via "$g" dev "$i"
+    else
+        sudo_if_needed ip route replace "$p" via "$g"
+    fi
+    ;;
+route-del) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; sudo_if_needed ip route del "$1" ;;
+default-gw)
+    want_help "${1:-}" && {
+        help_command "$CMD"
+        exit 0
+    }
+
+    require_args "$CMD" 1 "$@"
+
+    g="$1"
+    i="${2:-}"
+
+    attempts=10
+    delay=1
+
+    for ((n=1; n<=attempts; n++)); do
+        if [[ -n "$i" ]]; then
+            if sudo_if_needed ip route replace default via "$g" dev "$i"; then
+                exit 0
+            fi
+        else
+            if sudo_if_needed ip route replace default via "$g"; then
+                exit 0
+            fi
+        fi
+
+        if (( n < attempts )); then
+            echo \
+                "default-gw: gateway not ready; retrying in ${delay}s " \
+                "(${n}/${attempts})..." >&2
+            sleep "$delay"
+        fi
+    done
+
+    die "Unable to install default route via $g${i:+ dev $i}"
+    ;;
+link-up|link-down)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    require_args "$CMD" 1 "$@"
+    iface_exists "$1"
+    if [[ "$CMD" == link-up ]]; then
+        sudo_if_needed ip link set "$1" up
+    else
+        sudo_if_needed ip link set "$1" down
+    fi
+    ;;
+link-flap) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; i="$1"; s="${2:-5}"; iface_exists "$i"; sudo_if_needed ip link set "$i" down; sleep "$s"; sudo_if_needed ip link set "$i" up ;;
+path-test)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; d="$1"
+    echo '=== Route ==='; ip route get "$d" 2>/dev/null || ip -6 route get "$d" 2>/dev/null || true
+    echo; echo '=== Ping ==='; ping -c 5 "$d" || ping -6 -c 5 "$d" || true
+    echo; echo '=== Traceroute ==='; traceroute -n "$d" || true
+    echo; echo '=== MTR ==='; mtr -r -c 5 "$d" || true
+    echo; echo '=== Neighbors ==='; ip neigh
+    ;;
+port-test) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; nc -vz -w 3 "$1" "$2" ;;
+ports-scan) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; nmap -sT -Pn "$1" ;;
+capture) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; i="$1"; shift; sudo_if_needed tcpdump -nni "$i" "$@" ;;
+capture-save) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; i="$1"; f="$2"; shift 2; [[ "$f" = /* ]] || f="/pcaps/$f"; sudo_if_needed tcpdump -nni "$i" -w "$f" "$@" ;;
+capture-ring) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; i="$1"; f="$2"; mb="${3:-100}"; cnt="${4:-5}"; shift $(( $# >= 4 ? 4 : $# )); [[ "$f" = /* ]] || f="/pcaps/$f"; sudo_if_needed tcpdump -nni "$i" -C "$mb" -W "$cnt" -w "$f" "$@" ;;
+capture-read) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; f="$1"; shift; [[ "$f" = /* ]] || f="/pcaps/$f"; tcpdump -nn -r "$f" "$@" ;;
+capture-lacp|capture-igmp|capture-pim|capture-arp|capture-nd)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"
+    case "$CMD" in
+      capture-lacp) sudo_if_needed tcpdump -enni "$1" 'ether proto 0x8809' ;;
+      capture-igmp) sudo_if_needed tcpdump -nni "$1" igmp ;;
+      capture-pim) sudo_if_needed tcpdump -nni "$1" 'ip proto 103' ;;
+      capture-arp) sudo_if_needed tcpdump -enni "$1" arp ;;
+      capture-nd) sudo_if_needed tcpdump -nni "$1" 'icmp6 and (ip6[40] >= 133 and ip6[40] <= 136)' ;;
+    esac
+    ;;
+netem) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; i="$1"; shift; iface_exists "$i"; sudo_if_needed tc qdisc replace dev "$i" root netem "$@" ;;
+netem-clear) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; sudo_if_needed tc qdisc del dev "$1" root 2>/dev/null || true ;;
+netem-status) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; tc -s qdisc show dev "$1" ;;
+netem-profile)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; i="$1"; p="$2"
+    case "$p" in
+      clean) sudo_if_needed tc qdisc del dev "$i" root 2>/dev/null || true ;;
+      wan) sudo_if_needed tc qdisc replace dev "$i" root netem delay 20ms 2ms ;;
+      bad-wan) sudo_if_needed tc qdisc replace dev "$i" root netem delay 75ms 15ms loss 1% ;;
+      satellite) sudo_if_needed tc qdisc replace dev "$i" root netem delay 300ms 20ms loss 0.2% ;;
+      lossy) sudo_if_needed tc qdisc replace dev "$i" root netem delay 10ms loss 5% ;;
+      mobile) sudo_if_needed tc qdisc replace dev "$i" root netem delay 40ms 20ms loss 0.5% reorder 1% ;;
+      *) die "Unknown profile $p" ;;
+    esac
+    ;;
+rate-limit) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; sudo_if_needed tc qdisc replace dev "$1" root tbf rate "$2" burst 256kbit latency 400ms ;;
+rate-clear) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; sudo_if_needed tc qdisc del dev "$1" root 2>/dev/null || true ;;
+wan-create) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; a="$1"; b="$2"; br="${3:-br-wan}"; iface_exists "$a"; iface_exists "$b"; sudo_if_needed ip link add "$br" type bridge; sudo_if_needed ip link set "$a" master "$br"; sudo_if_needed ip link set "$b" master "$br"; sudo_if_needed ip link set "$a" up; sudo_if_needed ip link set "$b" up; sudo_if_needed ip link set "$br" up; echo "$a <-> $br <-> $b" ;;
+wan-impair) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; i="$1"; shift; sudo_if_needed tc qdisc replace dev "$i" root netem "$@" ;;
+wan-status) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; br="${1:-br-wan}"; ip -d link show "$br" 2>/dev/null || true; bridge link; tc qdisc show ;;
+wan-delete) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; br="${1:-br-wan}"; while read -r m; do [[ -n "$m" ]] && sudo_if_needed ip link set "$m" nomaster || true; done < <(ip -o link show master "$br" 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1); sudo_if_needed ip link del "$br" 2>/dev/null || true ;;
+iperf-server) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; exec iperf3 -s -p "${1:-5201}" ;;
+iperf-client) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; exec iperf3 -c "$1" -t "${2:-10}" ;;
+iperf-udp) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; exec iperf3 -c "$1" -u -b "$2" -t "${3:-10}" ;;
+iperf-reverse) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; exec iperf3 -c "$1" -R -t "${2:-10}" ;;
+iperf-bidir) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; exec iperf3 -c "$1" --bidir -t "${2:-10}" ;;
+iperf-parallel) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; exec iperf3 -c "$1" -P "$2" -t "${3:-10}" ;;
+iperf-bind) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; exec iperf3 -B "$1" -c "$2" -t "${3:-10}" ;;
+iperf-mcast-server) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; exec iperf -s -u -B "$1" -p "${2:-5001}" ;;
+iperf-mcast-send) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; exec iperf -c "$1" -u -b "$2" -t "${3:-10}" -T "${4:-32}" ;;
+iperf-test) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; s="$1"; echo '=== TCP forward ==='; iperf3 -c "$s" -t 5; echo '=== TCP reverse ==='; iperf3 -c "$s" -R -t 5; echo '=== TCP 4 streams ==='; iperf3 -c "$s" -P 4 -t 5; echo '=== UDP 100M ==='; iperf3 -c "$s" -u -b 100M -t 5 ;;
+mcast-join)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    require_args "$CMD" 2 "$@"
+    i="$1"; g="$2"; src="${3:-}"
+    if [[ -n "$src" ]]; then
+        exec mcjoin -i "$i" "${src}+${g}"
+    else
+        exec mcjoin -i "$i" "$g"
+    fi
+    ;;
+mcast-send) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; exec mcjoin -i "$1" -s -t "${3:-32}" "$2" ;;
+http-server) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; p="${1:-8080}"; d="${2:-/tmp}"; cd "$d"; exec python3 -m http.server "$p" --bind 0.0.0.0 ;;
+https-server)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; p="${1:-8443}"; d="${2:-/tmp}"; cert="$STATE/labhost.crt"; key="$STATE/labhost.key"
+    if [[ ! -f "$cert" ]]; then openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=labhost' -keyout "$key" -out "$cert" >/dev/null 2>&1; fi
+    cd "$d"
+    exec python3 - "$p" "$cert" "$key" <<'PY'
+import http.server,ssl,sys
+p=int(sys.argv[1]); c=sys.argv[2]; k=sys.argv[3]
+s=http.server.ThreadingHTTPServer(('0.0.0.0',p),http.server.SimpleHTTPRequestHandler)
+ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(c,k); s.socket=ctx.wrap_socket(s.socket,server_side=True); s.serve_forever()
+PY
+    ;;
+tcp-listen) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; exec socat -v TCP-LISTEN:"$1",fork,reuseaddr STDOUT ;;
+udp-listen) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; exec socat -v UDP-RECVFROM:"$1",fork STDOUT ;;
+dhcp-pool-create)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    require_args "$CMD" 5 "$@"
+    iface="$1"; start="$2"; end="$3"; mask="$4"; gw="$5"; dns="${6:-$5}"; lease="${7:-1h}"
+    iface_exists "$iface"
+    [[ "$iface" != "$MGMT_IF" && "$iface" != "$MGMT_VRF" ]] || die "Refusing to run a DHCP pool on the management interface/VRF."
+    ensure_intent_dir
+    f="$(dhcp_pool_path "$iface")"
+    cat >"$f" <<EOF
+iface=$(printf '%q' "$iface")
+start=$(printf '%q' "$start")
+end=$(printf '%q' "$end")
+mask=$(printf '%q' "$mask")
+gw=$(printf '%q' "$gw")
+dns=$(printf '%q' "$dns")
+lease=$(printf '%q' "$lease")
+EOF
+    echo "DHCP pool saved for $iface: $start-$end gateway $gw DNS $dns lease $lease"
+    if dhcp_server_running; then dhcp_server_start_impl; fi
+    ;;
+dhcp-pool-delete)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"
+    rm -f "$(dhcp_pool_path "$1")"
+    echo "DHCP pool removed for $1"
+    if dhcp_server_running; then
+        if compgen -G "$DHCP_SERVER_INTENT_DIR/*.conf" >/dev/null; then dhcp_server_start_impl; else dhcp_server_stop_impl; fi
+    fi
+    ;;
+dhcp-pool-list)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    printf '%-16s %-15s %-15s %-15s %-15s %-15s %s\n' INTERFACE START END NETMASK GATEWAY DNS LEASE
+    for f in "$DHCP_SERVER_INTENT_DIR"/*.conf; do
+        [[ -r "$f" ]] || continue
+        source "$f"
+        printf '%-16s %-15s %-15s %-15s %-15s %-15s %s\n' "$iface" "$start" "$end" "$mask" "$gw" "$dns" "$lease"
+    done
+    ;;
+dhcp-server-start)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    ensure_intent_dir
+    touch "$DHCP_SERVER_INTENT_DIR/.enabled"
+    if dhcp_server_running; then
+        echo "DHCP server is already running (PID $(cat "$DHCP_SERVER_PID"))."
+    else
+        dhcp_server_start_impl
+    fi
+    ;;
+dhcp-server-stop)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    dhcp_server_stop_impl; rm -f "$DHCP_SERVER_INTENT_DIR/.enabled"; echo 'DHCP server stopped.'
+    ;;
+dhcp-server-status)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    dhcp-pool-list
+    echo
+    if dhcp_server_running; then echo "DHCP server: RUNNING (PID $(cat "$DHCP_SERVER_PID"))"; else echo 'DHCP server: STOPPED'; fi
+    if [[ -s "$DHCP_SERVER_LEASES" ]]; then echo; echo '=== Leases ==='; cat "$DHCP_SERVER_LEASES"; fi
+    ;;
+dnsmasq-start)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    i="${1:-}"
+    args=(--no-daemon --log-queries --log-dhcp)
+    if [[ -n "$i" ]]; then
+        args+=(--interface="$i" --bind-interfaces)
+    fi
+    sudo_if_needed dnsmasq "${args[@]}"
+    ;;
+dnsmasq-stop) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; sudo_if_needed pkill dnsmasq || true ;;
+tftp-server) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; d="${1:-/tmp/tftp}"; sudo_if_needed mkdir -p "$d"; sudo_if_needed chmod 777 "$d"; exec sudo /usr/bin/in.tftpd --foreground --listen --address 0.0.0.0:69 --secure "$d" ;;
+lldp-start) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; sudo_if_needed lldpd; echo 'lldpd started' ;;
+lldp-show) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; lldpcli show neighbors details ;;
+lldp-stop) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; sudo_if_needed pkill lldpd || true ;;
+radius-test) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 4 "$@"; printf 'User-Name = "%s"\nUser-Password = "%s"\n' "$2" "$3" | radclient -x "$1" auth "$4" ;;
+snmp-walk) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; snmpwalk -v2c -c "${2:-public}" "$1" "${3:-1.3.6.1.2.1}" ;;
+snmp-get) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; snmpget -v2c -c "${3:-public}" "$1" "$2" ;;
+arp-watch) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; sudo_if_needed tcpdump -enni "$1" arp ;;
+nd-watch) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"; sudo_if_needed tcpdump -nni "$1" 'icmp6 and (ip6[40] >= 133 and ip6[40] <= 136)' ;;
+gratuitous-arp) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; sudo_if_needed arping -A -I "$1" -c 3 "$2" ;;
+arp-clear)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    if [[ -n "${1:-}" ]]; then
+        sudo_if_needed ip neigh flush dev "$1"
+    else
+        sudo_if_needed ip neigh flush all
+    fi
+    ;;
+pc-phone-create)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"
+    parent="$1"; shift; dhcp=1
+    [[ "${1:-}" == "--no-dhcp" ]] && { dhcp=0; shift; }
+    [[ $# -eq 0 ]] || die "Unknown option: $1"
+    iface_exists "$parent"; [[ "$parent" != "$MGMT_IF" && "$parent" != "$MGMT_VRF" ]] || die "Management interface cannot be a PC/phone port."
+    sudo_if_needed mkdir -p "$PC_PHONE_RUN_DIR"; ensure_intent_dir
+    # Creation is intentionally idempotent. A repeated create leaves live
+    # DHCP/LLDP state untouched. Use pc-phone-reprovision for a rebuild.
+    if [[ -r "$PC_PHONE_INTENT_DIR/${parent}.conf" ]]; then
+        echo "PC/phone already exists on $parent; no changes made."
+        exit 0
+    fi
+    read -r pc_mac phone_mac < <(python3 - "$parent" "$(hostname -s)" <<'PY'
+import hashlib,sys
+p,h=sys.argv[1:]
+def m(role):
+ d=hashlib.sha256(f"labhost:{h}:pc-phone:{p}:{role}".encode()).digest(); return "02:"+":".join(f"{x:02x}" for x in d[:5])
+print(m('pc'),m('phone'))
+PY
+)
+    # A PC/phone port owns the endpoint identity on the wire.  Suppress the
+    # normal host-wide lldpd advertisement and remove L3 identity from the
+    # parent so the container's original ethX MAC does not bleed into the
+    # access VLAN.  The PC and phone child identities carry endpoint traffic.
+    sudo_if_needed lldpcli configure ports "$parent" lldp status disabled >/dev/null 2>&1 || true
+    sudo_if_needed ip -4 addr flush dev "$parent" scope global 2>/dev/null || true
+    sudo_if_needed ip -6 addr flush dev "$parent" scope global 2>/dev/null || true
+
+    # The physical parent represents the phone's switch-facing Ethernet port.
+    # Save Containerlab's original MAC so delete can restore it, then make the
+    # parent itself use the deterministic phone MAC.  Any kernel-originated
+    # untagged traffic (IPv6 RS/ND, etc.) is therefore learned as PHONE_MAC
+    # rather than leaking a fourth container-interface identity to the switch.
+    origmac_file="$PC_PHONE_RUN_DIR/${parent}.origmac"
+    if [[ ! -r "$origmac_file" ]]; then
+        cat "/sys/class/net/$parent/address" | sudo_if_needed tee "$origmac_file" >/dev/null
+    fi
+    sudo_if_needed ip link set dev "$parent" down
+    sudo_if_needed ip link set dev "$parent" address "$phone_mac"
+    sudo_if_needed ip link set dev "$parent" up
+
+    pc="pp-${parent}-pc"; pc="${pc:0:15}"
+    ip link show "$pc" >/dev/null 2>&1 || sudo_if_needed ip link add link "$parent" name "$pc" address "$pc_mac" type macvlan mode bridge
+    sudo_if_needed ip link set "$pc" up
+    if (( dhcp )); then
+        sudo_if_needed dhcpcd -4 -q -b -C resolv.conf "$pc" >/dev/null 2>&1 || true
+    fi
+    pidfile="$PC_PHONE_RUN_DIR/${parent}.pid"; statefile="$PC_PHONE_RUN_DIR/${parent}.state"
+    if [[ -r "$pidfile" ]]; then sudo_if_needed kill "$(cat "$pidfile")" 2>/dev/null || true; fi
+    args=(/usr/local/lib/labhost/pc_phone_lldp.py --parent "$parent" --mac "$phone_mac" --name "$(hostname -s)-phone-${parent}" --state "$statefile")
+    (( dhcp )) && args+=(--dhcp)
+    sudo_if_needed bash -c 'log="$1"; pidfile="$2"; shift 2; nohup "$@" >"$log" 2>&1 & echo $! >"$pidfile"' _ "$PC_PHONE_RUN_DIR/${parent}.log" "$pidfile" "${args[@]}"
+    # Real phones initially speak untagged before/while learning their voice
+    # policy.  Emit a few ARP probes from the phone MAC so the switch can
+    # legitimately learn PHONE_MAC in the native VLAN.  Persistent learning
+    # on the switch may then retain it after voice traffic moves tagged.
+    sudo_if_needed python3 - "$parent" "$phone_mac" <<'PYARP' >/dev/null 2>&1 || true
+import socket,sys,time
+iface,mac=sys.argv[1:]
+src=bytes.fromhex(mac.replace(':',''))
+dst=b'\xff'*6
+# ARP probe: Ethernet src=phone MAC, sender IP 0.0.0.0, target IP 0.0.0.0.
+arp=b'\x00\x01\x08\x00\x06\x04\x00\x01'+src+b'\x00'*4+b'\x00'*6+b'\x00'*4
+frame=dst+src+b'\x08\x06'+arp
+s=socket.socket(socket.AF_PACKET,socket.SOCK_RAW); s.bind((iface,0))
+for _ in range(3): s.send(frame); time.sleep(.15)
+PYARP
+    if (( dhcp )); then printf 'pc-phone-create %q\n' "$parent" >"$PC_PHONE_INTENT_DIR/${parent}.conf"; else printf 'pc-phone-create %q --no-dhcp\n' "$parent" >"$PC_PHONE_INTENT_DIR/${parent}.conf"; fi
+    echo "PC/phone created on $parent"; echo "  PC:    $pc  $pc_mac  native/untagged"; echo "  Phone: $phone_mac  LLDP-MED waiting for Voice Network Policy"
+    ;;
+pc-phone-status|pc-phones-status)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; filter="${1:-}"
+    printf '%-7s %-13s %-18s %-15s %-18s %-7s %-15s %-4s %-4s %-4s\n' \
+        PARENT PC_IF PC_MAC PC_IP PHONE_MAC VOICE PHONE_IP TAG PRI DSCP
+    found=0
+    for f in "$PC_PHONE_INTENT_DIR"/*.conf; do
+        [[ -r "$f" ]] || continue
+        parent="${f##*/}"; parent="${parent%.conf}"
+        [[ -z "$filter" || "$filter" == "$parent" ]] || continue
+        found=1
+        read -r pc_mac phone_mac < <(python3 - "$parent" "$(hostname -s)" <<'PY'
+import hashlib,sys
+p,h=sys.argv[1:]
+def m(r):
+ d=hashlib.sha256(f"labhost:{h}:pc-phone:{p}:{r}".encode()).digest(); return "02:"+":".join(f"{x:02x}" for x in d[:5])
+print(m('pc'),m('phone'))
+PY
+)
+        pc="pp-${parent}-pc"; pc="${pc:0:15}"
+        pc_ip='-'; phone_ip='-'; voice='WAIT'; tag='-'; pri='-'; dscp_out='-'; voice_iface=''
+        if ip link show "$pc" >/dev/null 2>&1; then
+            pc_ip="$(ip -4 -o addr show dev "$pc" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+            [[ -n "$pc_ip" ]] || pc_ip='-'
+        fi
+        st="$PC_PHONE_RUN_DIR/${parent}.state"
+        if [[ -r "$st" ]]; then
+            unset vlan tagged priority dscp voice_iface
+            source "$st"
+            voice="${vlan:-?}"
+            case "${tagged:-}" in 1) tag='yes' ;; 0) tag='no' ;; *) tag='?' ;; esac
+            pri="${priority:-?}"; dscp_out="${dscp:-?}"
+            if [[ -n "${voice_iface:-}" ]] && ip link show "$voice_iface" >/dev/null 2>&1; then
+                phone_ip="$(ip -4 -o addr show dev "$voice_iface" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+                [[ -n "$phone_ip" ]] || phone_ip='-'
+            fi
+        fi
+        printf '%-7s %-13s %-18s %-15s %-18s %-7s %-15s %-4s %-4s %-4s\n' \
+            "$parent" "$pc" "$pc_mac" "$pc_ip" "$phone_mac" "$voice" "$phone_ip" "$tag" "$pri" "$dscp_out"
+    done
+    if [[ -n "$filter" && $found -eq 0 ]]; then
+        die "No PC/phone intent for $filter"
+    fi
+    ;;
+pc-phones-create)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    [[ $# -ge 1 ]] || { help_command "$CMD"; exit 2; }
+    dhcp_opt=(); all=0; parents=()
+    for arg in "$@"; do
+        case "$arg" in
+            --all) all=1 ;;
+            --no-dhcp) dhcp_opt=(--no-dhcp) ;;
+            --*) die "Unknown option: $arg" ;;
+            *) parents+=("$arg") ;;
+        esac
+    done
+    if (( all )); then
+        (( ${#parents[@]} == 0 )) || die "Do not combine --all with explicit parent interfaces."
+        mapfile -t parents < <(
+            for path in /sys/class/net/eth[0-9]*; do
+                [[ -e "$path" ]] || continue
+                i="${path##*/}"
+                [[ "$i" =~ ^eth[0-9]+$ ]] || continue
+                [[ "$i" != "$MGMT_IF" ]] || continue
+                printf '%s\n' "$i"
+            done | sort -V
+        )
+    fi
+    (( ${#parents[@]} > 0 )) || die "No dataplane interfaces found."
+    rc=0
+    for parent in "${parents[@]}"; do
+        echo "=== $parent ==="
+        if ! /usr/local/bin/pc-phone-create "$parent" "${dhcp_opt[@]}"; then rc=1; fi
+    done
+    exit "$rc"
+    ;;
+pc-phone-reprovision)
+    require_args "$CMD" 1 "$@"; parent="$1"; f="$PC_PHONE_INTENT_DIR/${parent}.conf"; [[ -r "$f" ]] || die "No PC/phone intent for $parent"
+    # Preserve the high-level create intent before delete removes its file.
+    intent="$(cat "$f")"
+    /usr/local/bin/pc-phone-delete "$parent"
+    bash -c "$intent"
+    ;;
+pc-phone-delete)
+    require_args "$CMD" 1 "$@"; parent="$1"; pidfile="$PC_PHONE_RUN_DIR/${parent}.pid"; st="$PC_PHONE_RUN_DIR/${parent}.state"
+    [[ -r "$pidfile" ]] && sudo_if_needed kill "$(cat "$pidfile")" 2>/dev/null || true
+    if [[ -r "$st" ]]; then voice_iface=""; source "$st"; [[ -n "${voice_iface:-}" && "$voice_iface" != "$parent" ]] && sudo_if_needed ip link del "$voice_iface" 2>/dev/null || true; fi
+    pc="pp-${parent}-pc"; pc="${pc:0:15}"; sudo_if_needed ip link del "$pc" 2>/dev/null || true
+    # Restore Containerlab's original parent MAC before returning LLDP ownership.
+    origmac_file="$PC_PHONE_RUN_DIR/${parent}.origmac"
+    if [[ -r "$origmac_file" ]]; then
+        original_mac="$(cat "$origmac_file")"
+        sudo_if_needed ip link set dev "$parent" down
+        sudo_if_needed ip link set dev "$parent" address "$original_mac"
+        sudo_if_needed ip link set dev "$parent" up
+    fi
+    # Return LLDP ownership to normal labhost behavior when the abstraction is removed.
+    sudo_if_needed lldpcli configure ports "$parent" lldp status rx-and-tx >/dev/null 2>&1 || true
+    rm -f "$PC_PHONE_INTENT_DIR/${parent}.conf" "$pidfile" "$st" "$PC_PHONE_RUN_DIR/${parent}.log" "$origmac_file" 2>/dev/null || true
+    echo "PC/phone removed from $parent"
+    ;;
+clients-create)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 3 "$@"
+    parent="$1"; count="$2"; cidr="$3"; start="${4:-10}"; iface_exists "$parent"
+    [[ "$count" =~ ^[1-9][0-9]*$ ]] || die "count must be a positive integer"
+
+    last_client="$(
+        ip -o link show type macvlan 2>/dev/null |
+        awk -F': ' '{print $2}' | cut -d@ -f1 |
+        sed -nE 's/^cl([0-9]+)$/\1/p' | sort -n | tail -1
+    )"
+    if [[ -n "$last_client" ]]; then
+        client_start=$((10#$last_client + 1))
+    else
+        client_start=1
+    fi
+
+    tmpfile="$(mktemp)"
+    trap 'rm -f "$tmpfile"' RETURN
+    python3 - "$count" "$cidr" "$start" "$client_start" "$(hostname -s)" >"$tmpfile" <<'PY'
+import hashlib, ipaddress, sys
+count=int(sys.argv[1]); cidr=sys.argv[2]; start_arg=sys.argv[3]
+client_start=int(sys.argv[4]); host=sys.argv[5]
+net=ipaddress.ip_network(cidr, strict=False)
+try:
+    first=net.network_address+int(start_arg)
+except ValueError:
+    first=ipaddress.ip_address(start_arg)
+    if first not in net: raise SystemExit("starting IP is outside subnet")
+for offset in range(count):
+    ip=first+offset
+    if ip not in net or ip in (net.network_address, net.broadcast_address):
+        raise SystemExit("address range exceeds subnet")
+    client_num=client_start+offset
+    name=f"cl{client_num:03d}"
+    digest=hashlib.sha256(f"labhost:{host}:client:{client_num}".encode()).digest()
+    mac="02:"+":".join(f"{b:02x}" for b in digest[:5])
+    print(name,mac,f"{ip}/{net.prefixlen}")
+PY
+
+    created=0
+    first_name=""
+    last_name=""
+    while read -r name mac addr; do
+        [[ -n "$first_name" ]] || first_name="$name"
+        last_name="$name"
+        echo "Creating $name  $addr  $mac  on $parent"
+        sudo_if_needed ip link add link "$parent" name "$name" address "$mac" type macvlan mode bridge
+        sudo_if_needed ip addr add "$addr" dev "$name"
+        sudo_if_needed ip link set "$name" up
+        sudo_if_needed sysctl -w "net.ipv4.conf.${name}.arp_ignore=1" >/dev/null
+        sudo_if_needed sysctl -w "net.ipv4.conf.${name}.arp_announce=2" >/dev/null
+        created=$((created + 1))
+    done <"$tmpfile"
+    rm -f "$tmpfile"
+    trap - RETURN
+
+    if (( created > 0 )); then
+        ensure_intent_dir
+        printf 'clients-create %q %q %q %q\n' "$parent" "$count" "$cidr" "$start" >"$CLIENT_INTENT_DIR/${first_name}-${last_name}.conf"
+    fi
+    echo
+    echo "$created clients created."
+    [[ -n "$last_name" ]] && echo "Client interfaces now range through $last_name."
+    ;;
+clients-list) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; ip -d -o link show type macvlan | strip_peer || true; ip -br addr | grep '^cl[0-9]' | strip_peer || true ;;
+clients-status)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    printf '%-8s %-14s %-18s %-18s %-10s %-12s\n' CLIENT PARENT MAC IPv4 ARP_IGNORE ARP_ANNOUNCE
+    while read -r iface; do
+        [[ -n "$iface" ]] || continue
+        parent="$(ip -o link show "$iface" | awk -F'@' '{print $2}' | awk -F': ' '{print $1}' | awk '{print $1}')"
+        mac="$(cat "/sys/class/net/$iface/address" 2>/dev/null || echo '?')"
+        addr="$(ip -4 -o addr show dev "$iface" scope global | awk '{print $4}' | head -1)"
+        ai="$(sysctl -n "net.ipv4.conf.${iface}.arp_ignore" 2>/dev/null || echo '?')"
+        aa="$(sysctl -n "net.ipv4.conf.${iface}.arp_announce" 2>/dev/null || echo '?')"
+        printf '%-8s %-14s %-18s %-18s %-10s %-12s\n' "$iface" "${parent:-?}" "$mac" "${addr:---}" "$ai" "$aa"
+    done < <(ip -o link show type macvlan 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^cl[0-9]' | sort -V || true)
+    ;;
+clients-delete)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    while read -r x; do [[ -n "$x" ]] && sudo_if_needed ip link del "$x" || true; done < <(ip -o link show type macvlan 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^cl[0-9]' || true)
+    rm -f "$CLIENT_INTENT_DIR"/cl*-cl*.conf 2>/dev/null || true
+    ;;
+clients-arp)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; count=0
+    while read -r iface; do
+        [[ -n "$iface" ]] || continue
+        ipaddr="$(ip -4 -o addr show dev "$iface" | awk '{print $4}' | cut -d/ -f1 | head -1)"
+        [[ -n "$ipaddr" ]] || continue
+        printf '%-8s %-15s ' "$iface" "$ipaddr"
+        if sudo_if_needed arping -A -c 1 -I "$iface" "$ipaddr" >/dev/null 2>&1; then echo "ARP sent"; count=$((count + 1)); else echo "FAILED"; fi
+    done < <(ip -o link show type macvlan 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^cl[0-9]' | sort -V || true)
+    echo; echo "$count gratuitous ARPs sent."
+    ;;
+clients-ping)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 1 "$@"
+    dst="$1"; ping_count="${2:-1}"
+    while read -r iface; do
+        [[ -n "$iface" ]] || continue
+        ipaddr="$(ip -4 -o addr show dev "$iface" | awk '{print $4}' | cut -d/ -f1 | head -1)"
+        [[ -n "$ipaddr" ]] || continue
+        printf '%-8s %-15s -> %-15s ' "$iface" "$ipaddr" "$dst"
+        if ping -I "$iface" -c "$ping_count" -W 1 "$dst" >/dev/null 2>&1; then echo OK; else echo 'NO REPLY'; fi
+    done < <(ip -o link show type macvlan 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^cl[0-9]' | sort -V || true)
+    ;;
+clients-traffic)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"
+    dst="$1"; port="$2"; interval="${3:-1}"
+    while true; do
+        while read -r iface; do
+            [[ -n "$iface" ]] || continue
+            ipaddr="$(ip -4 -o addr show dev "$iface" | awk '{print $4}' | cut -d/ -f1 | head -1)"
+            [[ -n "$ipaddr" ]] || continue
+            printf 'client=%s ip=%s time=%s\n' "$iface" "$ipaddr" "$(date +%s)" | socat - "UDP-DATAGRAM:${dst}:${port},bind=${ipaddr}" >/dev/null 2>&1 || true
+        done < <(ip -o link show type macvlan 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep '^cl[0-9]' | sort -V || true)
+        sleep "$interval"
+    done
+    ;;
+endpoint-move) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 4 "$@"; old="$1"; new="$2"; addr="$3"; mac="$4"; sudo_if_needed ip addr del "$addr" dev "$old" 2>/dev/null || true; sudo_if_needed ip link set "$old" down; sudo_if_needed ip link set "$new" down; sudo_if_needed ip link set "$new" address "$mac"; sudo_if_needed ip addr replace "$addr" dev "$new"; sudo_if_needed ip link set "$new" up; sudo_if_needed arping -A -I "$new" -c 3 "${addr%/*}" || true ;;
+send-tcp)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"
+    dest="$1"; port="$2"; shift 2; msg=""; count=1; interval=0; source_ip=""
+    if [[ $# -gt 0 && "$1" != --* ]]; then msg="$1"; shift; fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --count) count="${2:?--count requires a value}"; shift 2 ;;
+          --interval) interval="${2:?--interval requires a value}"; shift 2 ;;
+          --source) source_ip="${2:?--source requires a value}"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+    done
+    if [[ -z "$msg" && ! -t 0 ]]; then msg="$(cat)"; fi
+    [[ -n "$msg" ]] || msg="labhost-test"
+    for ((n=1;n<=count;n++)); do
+        if [[ -n "$source_ip" ]]; then
+            printf '%s\n' "$msg" | socat - "TCP:$dest:$port,bind=$source_ip"
+        else
+            printf '%s\n' "$msg" | nc -w3 "$dest" "$port"
+        fi
+        if (( n < count )); then
+            sleep "$interval"
+        fi
+    done
+    ;;
+send-udp) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; printf '%s\n' "${3:-labhost-test}" | nc -u -w1 "$1" "$2" ;;
+send-broadcast) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 2 "$@"; i="$1"; p="$2"; msg="${3:-labhost-broadcast}"; bcast="$(ip -4 -o addr show dev "$i" | awk '{print $6}' | head -1)"; [[ -n "$bcast" ]] || die "No broadcast address on $i"; printf '%s\n' "$msg" | socat - UDP-DATAGRAM:"$bcast:$p",broadcast ;;
+send-mcast) want_help "${1:-}" && { help_command "$CMD"; exit 0; }; require_args "$CMD" 3 "$@"; i="$1"; g="$2"; p="$3"; msg="${4:-labhost-multicast}"; src="$(ip -4 -o addr show dev "$i" scope global | awk '{print $4}' | cut -d/ -f1 | head -1)"; [[ -n "$src" ]] || die "No IPv4 address on $i"; printf '%s\n' "$msg" | socat - UDP-DATAGRAM:"$g:$p",ip-multicast-if="$src",ip-multicast-ttl=32 ;;
+lab-save)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+    dry=false; [[ "${1:-}" == "--dry-run" ]] && dry=true
+    [[ $# -gt 0 && "${1:-}" != "--dry-run" ]] && { help_command "$CMD"; exit 2; }
+    generated="$(mktemp)"; trap 'rm -f "$generated"' EXIT; generate_startup >"$generated"
+    if $dry; then cat "$generated"; exit 0; fi
+    [[ -d "$CONFIG_DIR" ]] || die "$CONFIG_DIR is not mounted. Add './configs:/config' to the Containerlab node."
+    target="$(startup_path)"; [[ -f "$target" ]] && cp -a "$target" "${target}.bak"
+    cp "$generated" "$target"; chmod 0755 "$target"
+    echo "Saved startup configuration: $target"
+
+    if [[ -f "${target}.bak" ]]; then
+        echo "Previous configuration backup: ${target}.bak"
+    fi
+
+;;
+lab-config)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }; action="${1:-show}"; f="$(startup_path)"
+    case "$action" in
+      show) [[ -f "$f" ]] || die "No startup configuration exists at $f"; cat "$f" ;;
+      path) echo "$f" ;;
+      edit) [[ -e "$f" ]] || { [[ -d "$CONFIG_DIR" ]] || die "$CONFIG_DIR is not mounted."; touch "$f"; chmod 0755 "$f"; }; editor="${EDITOR:-}"; [[ -n "$editor" ]] || { command -v nano >/dev/null && editor=nano || editor=vi; }; exec "$editor" "$f" ;;
+      *) help_command "$CMD"; exit 2 ;;
+    esac
+    ;;
+lab-reset)
+    want_help "${1:-}" && { help_command "$CMD"; exit 0; }
+
+    echo 'Removing PC/phone objects...'
+    if [[ -d "$PC_PHONE_INTENT_DIR" ]]; then
+        while read -r f; do
+            [[ -n "$f" ]] || continue
+            parent="$(basename "$f" .conf)"
+            /usr/local/bin/pc-phone-delete "$parent" >/dev/null 2>&1 || true
+        done < <(find "$PC_PHONE_INTENT_DIR" -maxdepth 1 -type f -name '*.conf' -print 2>/dev/null | sort)
+    fi
+    # Also remove orphaned runtime phone state if an intent file was lost.
+    if [[ -d "$PC_PHONE_RUN_DIR" ]]; then
+        while read -r f; do
+            [[ -n "$f" ]] || continue
+            parent="$(basename "$f" .origmac)"
+            /usr/local/bin/pc-phone-delete "$parent" >/dev/null 2>&1 || true
+        done < <(find "$PC_PHONE_RUN_DIR" -maxdepth 1 -type f -name '*.origmac' -print 2>/dev/null | sort)
+    fi
+    rm -rf "$PC_PHONE_RUN_DIR" 2>/dev/null || true
+    rm -f "$PC_PHONE_INTENT_DIR"/*.conf 2>/dev/null || true
+
+    echo 'Stopping DHCP services and clients...'
+    dhcp_server_stop_impl || true
+    sudo_if_needed pkill -x dhcpcd 2>/dev/null || true
+    rm -f "$DHCP_INTENT_DIR"/* 2>/dev/null || true
+    rm -f "$DHCP_SERVER_INTENT_DIR"/*.conf "$DHCP_SERVER_INTENT_DIR/.enabled" 2>/dev/null || true
+    sudo_if_needed rm -rf "$DHCP_SERVER_RUN_DIR" 2>/dev/null || true
+
+    echo 'Removing test qdiscs...'
+    while read -r i; do
+        [[ "$i" == "$MGMT_IF" || "$i" == "$MGMT_VRF" || "$i" == lo ]] && continue
+        sudo_if_needed tc qdisc del dev "$i" root 2>/dev/null || true
+    done < <(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1)
+
+    echo 'Removing macvlan clients...'
+    clients-delete || true
+
+    echo 'Removing VLAN/QinQ interfaces...'
+    while read -r v; do
+        [[ -n "$v" ]] && sudo_if_needed ip link del "$v" 2>/dev/null || true
+    done < <(ip -d -o link show type vlan 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | tac)
+
+    echo 'Removing bonds...'
+    if compgen -G '/proc/net/bonding/*' >/dev/null; then
+        for f in /proc/net/bonding/*; do sudo_if_needed ip link del "${f##*/}" 2>/dev/null || true; done
+    fi
+
+    echo 'Removing user-created VRFs...'
+    while read -r v; do
+        [[ "$v" == "$MGMT_VRF" ]] && continue
+        [[ -n "$v" ]] && sudo_if_needed ip link del "$v" 2>/dev/null || true
+    done < <(ip -o link show type vrf 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}' | cut -d@ -f1)
+
+    sudo_if_needed ip link del br-wan 2>/dev/null || true
+    sudo_if_needed pkill -f 'python3 -m http.server|in.tftpd|socat.*LISTEN|iperf3 -s|iperf -s' 2>/dev/null || true
+
+    echo 'Flushing dataplane addresses and routes...'
+    while read -r i; do
+        [[ -n "$i" ]] || continue
+        [[ "$i" == "$MGMT_IF" || "$i" == "$MGMT_VRF" || "$i" == lo ]] && continue
+        [[ "$i" =~ ^eth[1-9][0-9]*$ ]] || continue
+        sudo_if_needed ip -4 addr flush dev "$i" scope global 2>/dev/null || true
+        sudo_if_needed ip -6 addr flush dev "$i" scope global 2>/dev/null || true
+        sudo_if_needed ip -4 route flush dev "$i" 2>/dev/null || true
+        sudo_if_needed ip -6 route flush dev "$i" 2>/dev/null || true
+    done < <(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1)
+
+    echo 'Restoring default dataplane MTU...'
+    while read -r i; do
+        [[ -n "$i" ]] || continue
+        [[ "$i" =~ ^eth[1-9][0-9]*$ ]] || continue
+        sudo_if_needed ip link set dev "$i" mtu "$DEFAULT_DATA_MTU" 2>/dev/null || true
+    done < <(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1)
+    rm -f "$MTU_ALL_INTENT" 2>/dev/null || true
+
+    echo 'Reset complete; Containerlab management VRF/path and saved startup script were preserved.'
+
+    ;;
+*) echo "Unknown helper: $CMD"; usage; exit 2 ;;
+esac
