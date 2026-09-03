@@ -149,19 +149,31 @@ pass "eth0 -> vrf-mgmt/table 4094 and management default route are correct"
 
 section "SSH"
 
-docker exec "$NAME" ss -lnt | grep -E '(:22[[:space:]]|:22$)' >/dev/null \
-    || fail "sshd is not listening on TCP/22."
+ssh_listening=false
+for _ in $(seq 1 40); do
+    if docker exec "$NAME" ss -lnt | grep -E '(:22[[:space:]]|:22$)' >/dev/null; then
+        ssh_listening=true
+        break
+    fi
+    sleep 0.25
+done
+[[ "$ssh_listening" == true ]] || fail "sshd is not listening on TCP/22."
+pass "sshd is listening on TCP/22"
 
 # This validates that Docker can reach the wildcard SSH listener after eth0
 # moved into the VRF. It is supplemental to the in-container listener check.
 if command -v nc >/dev/null 2>&1; then
-    for _ in $(seq 1 20); do
+    ssh_reachable=false
+    for _ in $(seq 1 40); do
         if nc -z -w1 127.0.0.1 "$PORT" >/dev/null 2>&1; then
-            pass "Published SSH port is reachable on localhost:$PORT"
+            ssh_reachable=true
             break
         fi
         sleep 0.25
     done
+    [[ "$ssh_reachable" == true ]] \
+        || fail "Published SSH port is not reachable on localhost:$PORT"
+    pass "Published SSH port is reachable on localhost:$PORT"
 else
     echo "INFO: host 'nc' not installed; skipping published-port reachability test."
 fi
@@ -282,7 +294,7 @@ docker run -d --rm \
 published="$(docker port "$NAME" 22/tcp | head -1)"
 PORT="${published##*:}"
 
-for _ in $(seq 1 20); do
+for _ in $(seq 1 40); do
     if [[ -f "$CONFIG_DIR/startup-ran.txt" ]]; then
         break
     fi
