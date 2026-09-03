@@ -46,7 +46,6 @@ docker run -d --rm \
     --cap-add NET_ADMIN \
     --cap-add NET_RAW \
     --sysctl net.ipv4.tcp_l3mdev_accept=1 \
-    --sysctl net.ipv4.tcp_l3mdev_accept=1 \
     -p 127.0.0.1::22 \
     -v "$CONFIG_DIR:/config" \
     -v "$PCAP_DIR:/pcaps" \
@@ -74,8 +73,8 @@ pass "Docker assigned localhost SSH port $PORT"
 section "VERSION / PATH / CORE BINARIES"
 
 version="$(docker exec "$NAME" sh -lc 'printf "%s" "${LABHOST_VERSION:-unknown}"')"
-[[ "$version" == "1.3" ]] || fail "Expected LABHOST_VERSION=1.3, got '$version'."
-pass "LABHOST_VERSION=1.3"
+[[ "$version" == "1.4-dev22" ]] || fail "Expected LABHOST_VERSION=1.4-dev22, got '$version'."
+pass "LABHOST_VERSION=1.4-dev22"
 
 path_value="$(docker exec "$NAME" sh -lc 'printf "%s" "$PATH"')"
 echo "PATH=$path_value"
@@ -262,6 +261,7 @@ docker run -d --rm \
     --hostname smokehost \
     --cap-add NET_ADMIN \
     --cap-add NET_RAW \
+    --sysctl net.ipv4.tcp_l3mdev_accept=1 \
     -p 127.0.0.1::22 \
     -v "$CONFIG_DIR:/config" \
     -v "$PCAP_DIR:/pcaps" \
