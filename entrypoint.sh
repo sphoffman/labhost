@@ -22,6 +22,13 @@ fi
 chmod 700 /home/lab/.ssh
 chown lab:lab /home/lab/.ssh
 
+# Runtime intent is working metadata used by lab-save.  It intentionally lives
+# under /run so interactive configuration is not persistent until lab-save
+# writes /config/<hostname>.sh.  The lab user must be able to create/update
+# intent files through the helper commands.
+mkdir -p /run/labhost/intents
+chown -R lab:lab /run/labhost/intents
+
 #
 # labhost v1.3 management VRF
 #
