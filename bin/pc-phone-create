@@ -1,0 +1,89 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG_DIR=/config
+STATE=/run/labhost
+INTENT_DIR="${LABHOST_INTENT_DIR:-$CONFIG_DIR/.labhost}"
+PC_PHONE_INTENT_DIR="$INTENT_DIR/pc-phones"
+PC_PHONE_RUN_DIR="$STATE/pc-phones"
+MGMT_IF="${LABHOST_MGMT_IF:-eth0}"
+MGMT_VRF="${LABHOST_MGMT_VRF:-vrf-mgmt}"
+
+usage() {
+    cat <<'EOF'
+Usage: pc-phone-create <parent> [--no-dhcp]
+
+Create or converge one simulated PC-behind-phone endpoint on a switch-facing
+interface. DHCP is enabled by default.
+
+The command is restart-safe: if persistent intent exists but the runtime
+PC/phone state is missing or stale, it rebuilds the object automatically.
+EOF
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+[[ "${1:-}" == "--help" || "${1:-}" == "-h" ]] && { usage; exit 0; }
+[[ $# -ge 1 ]] || { usage; exit 2; }
+
+parent="$1"
+shift
+dhcp=1
+if [[ "${1:-}" == "--no-dhcp" ]]; then
+    dhcp=0
+    shift
+fi
+[[ $# -eq 0 ]] || die "Unknown option: $1"
+[[ -e "/sys/class/net/$parent" ]] || die "Interface '$parent' does not exist."
+[[ "$parent" != "$MGMT_IF" && "$parent" != "$MGMT_VRF" ]] || die "Management interface cannot be a PC/phone port."
+
+mkdir -p "$PC_PHONE_INTENT_DIR" "$PC_PHONE_RUN_DIR" 2>/dev/null || true
+intent="$PC_PHONE_INTENT_DIR/${parent}.conf"
+pidfile="$PC_PHONE_RUN_DIR/${parent}.pid"
+pc="pp-${parent}-pc"
+pc="${pc:0:15}"
+
+read -r pc_mac phone_mac < <(python3 - "$parent" "$(hostname -s)" <<'PY'
+import hashlib,sys
+p,h=sys.argv[1:]
+def m(role):
+    d=hashlib.sha256(f"labhost:{h}:pc-phone:{p}:{role}".encode()).digest()
+    return "02:"+":".join(f"{x:02x}" for x in d[:5])
+print(m('pc'),m('phone'))
+PY
+)
+
+requested_intent="pc-phone-create $(printf '%q' "$parent")"
+(( dhcp )) || requested_intent+=" --no-dhcp"
+
+runtime_healthy=0
+if [[ -r "$intent" && -e "/sys/class/net/$pc" ]]; then
+    parent_mac="$(cat "/sys/class/net/$parent/address" 2>/dev/null || true)"
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ "${parent_mac,,}" == "${phone_mac,,}" && "$pid" =~ ^[0-9]+$ ]] && ps -p "$pid" >/dev/null 2>&1; then
+        cmdline="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+        if [[ "$cmdline" == *pc_phone_lldp.py* && "$cmdline" == *"--parent $parent"* ]]; then
+            runtime_healthy=1
+        fi
+    fi
+fi
+
+if [[ -r "$intent" ]]; then
+    existing_intent="$(tr -d '\r\n' < "$intent")"
+    if (( runtime_healthy )) && [[ "$existing_intent" == "$requested_intent" ]]; then
+        echo "PC/phone already healthy on $parent; no changes made."
+        exit 0
+    fi
+
+    echo "PC/phone intent exists on $parent but runtime state needs convergence; rebuilding."
+    /usr/local/bin/pc-phone-delete "$parent" >/dev/null
+fi
+
+# The labctl implementation performs the actual construction and records the
+# high-level persistent intent.  Calling it explicitly avoids recursion through
+# this public convergence wrapper.
+if (( dhcp )); then
+    exec /usr/local/bin/labctl pc-phone-create "$parent"
+else
+    exec /usr/local/bin/labctl pc-phone-create "$parent" --no-dhcp
+fi
