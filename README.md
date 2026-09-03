@@ -36,12 +36,15 @@ the repository root so the Docker context is correct:
 cd /storage/Labs
 git switch labhost-phase3r4-r3
 git pull --ff-only
-docker build -t labhost:1.4-dev24 images/labhost
+docker build -t labhost:1.4 images/labhost
 ```
 
-Do not replace `labhost:latest`, build the final `labhost:1.4` image, merge
-to `main`, or create the `labhost-v1.4` tag until final regression and
-release verification have passed.
+Validate the versioned image before updating `labhost:latest`:
+
+```bash
+images/labhost/smoke-test.sh labhost:1.4
+docker tag labhost:1.4 labhost:latest
+```
 
 ## Host bonding support
 
@@ -76,7 +79,7 @@ Because bonding is loaded by the host kernel, every labhost container can use LA
 ## Quick validation
 
 ```bash
-images/labhost/smoke-test.sh labhost:1.4-dev24
+images/labhost/smoke-test.sh labhost:1.4
 ```
 
 ---
@@ -189,7 +192,7 @@ A reusable labhost node should look like:
 ```yaml
 host4:
   kind: linux
-  image: labhost:1.4-dev24
+  image: labhost:1.4
   binds:
     - ./configs:/config
     - ./pcaps:/pcaps
@@ -232,7 +235,7 @@ docker run -d \
   -v "$(pwd)/configs:/config" \
   -v "$(pwd)/pcaps:/pcaps" \
   -e LAB_PASSWORD=lab \
-  labhost:1.4-dev24
+  labhost:1.4
 ```
 
 Docker will choose an available localhost port for SSH. Find it with:
