@@ -1,0 +1,28 @@
+#!/bin/bash
+set -euo pipefail
+
+REAL_DHCPCD=/usr/sbin/dhcpcd
+
+# Preserve explicit caller-supplied client identifiers (the simulated phone
+# path already supplies one) and leave ordinary labhost DHCP behavior alone.
+for arg in "$@"; do
+    case "$arg" in
+        -I|--clientid|--clientid=*) exec "$REAL_DHCPCD" "$@" ;;
+    esac
+done
+
+# pc-phone-create names the native PC endpoint pp-<parent>-pc.  dhcpcd's
+# default DHCPv4 identity is DUID+IAID; the DUID is container runtime state and
+# changes across fresh deployments.  For these deterministic simulated PCs,
+# force the RFC2132 Ethernet client identifier: type 1 + endpoint MAC.
+iface=""
+for arg in "$@"; do
+    [[ "$arg" == pp-*-pc ]] && iface="$arg"
+done
+
+if [[ -n "$iface" && -r "/sys/class/net/$iface/address" ]]; then
+    mac="$(tr '[:upper:]' '[:lower:]' < "/sys/class/net/$iface/address")"
+    exec "$REAL_DHCPCD" -I "01:$mac" "$@"
+fi
+
+exec "$REAL_DHCPCD" "$@"
