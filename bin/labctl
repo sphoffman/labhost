@@ -1548,8 +1548,12 @@ PY
         sudo_if_needed ip link add link "$parent" name "$name" address "$mac" type macvlan mode bridge
         sudo_if_needed ip addr add "$addr" dev "$name"
         sudo_if_needed ip link set "$name" up
-        sudo_if_needed sysctl -w "net.ipv4.conf.${name}.arp_ignore=1" >/dev/null
-        sudo_if_needed sysctl -w "net.ipv4.conf.${name}.arp_announce=2" >/dev/null
+        if [[ "$(sysctl -n "net.ipv4.conf.${name}.arp_ignore" 2>/dev/null || true)" != "1" ]]; then
+            sudo_if_needed sysctl -w "net.ipv4.conf.${name}.arp_ignore=1" >/dev/null
+        fi
+        if [[ "$(sysctl -n "net.ipv4.conf.${name}.arp_announce" 2>/dev/null || true)" != "2" ]]; then
+            sudo_if_needed sysctl -w "net.ipv4.conf.${name}.arp_announce=2" >/dev/null
+        fi
         created=$((created + 1))
     done <"$tmpfile"
     rm -f "$tmpfile"

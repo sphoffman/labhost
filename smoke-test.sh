@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-IMAGE="${1:-labhost:1.4-dev22}"
+IMAGE="${1:-labhost:1.4-dev23}"
 NAME="${LABHOST_SMOKE_NAME:-labhost-smoke}"
 
 TMPDIR="$(mktemp -d)"
@@ -46,6 +46,8 @@ docker run -d --rm \
     --cap-add NET_ADMIN \
     --cap-add NET_RAW \
     --sysctl net.ipv4.tcp_l3mdev_accept=1 \
+    --sysctl net.ipv4.conf.default.arp_ignore=1 \
+    --sysctl net.ipv4.conf.default.arp_announce=2 \
     -p 127.0.0.1::22 \
     -v "$CONFIG_DIR:/config" \
     -v "$PCAP_DIR:/pcaps" \
@@ -73,8 +75,8 @@ pass "Docker assigned localhost SSH port $PORT"
 section "VERSION / PATH / CORE BINARIES"
 
 version="$(docker exec "$NAME" sh -lc 'printf "%s" "${LABHOST_VERSION:-unknown}"')"
-[[ "$version" == "1.4-dev22" ]] || fail "Expected LABHOST_VERSION=1.4-dev22, got '$version'."
-pass "LABHOST_VERSION=1.4-dev22"
+[[ "$version" == "1.4-dev23" ]] || fail "Expected LABHOST_VERSION=1.4-dev23, got '$version'."
+pass "LABHOST_VERSION=1.4-dev23"
 
 path_value="$(docker exec "$NAME" sh -lc 'printf "%s" "$PATH"')"
 echo "PATH=$path_value"
@@ -199,6 +201,9 @@ docker exec "$NAME" clients-list | grep '198.51.100.100/24' >/dev/null \
     || fail "clients-create literal starting IP was not applied."
 docker exec "$NAME" clients-list | grep '198.51.100.101/24' >/dev/null \
     || fail "clients-create did not increment literal starting IP."
+docker exec "$NAME" clients-status | awk \
+    '$1 ~ /^cl[0-9]+$/ && $5 == "1" && $6 == "2" { found++ } END { exit !(found == 2) }' \
+    || fail "Synthetic clients do not have arp_ignore=1 and arp_announce=2."
 docker exec "$NAME" clients-delete
 pass "clients-create accepts a literal starting IP"
 
@@ -262,6 +267,8 @@ docker run -d --rm \
     --cap-add NET_ADMIN \
     --cap-add NET_RAW \
     --sysctl net.ipv4.tcp_l3mdev_accept=1 \
+    --sysctl net.ipv4.conf.default.arp_ignore=1 \
+    --sysctl net.ipv4.conf.default.arp_announce=2 \
     -p 127.0.0.1::22 \
     -v "$CONFIG_DIR:/config" \
     -v "$PCAP_DIR:/pcaps" \

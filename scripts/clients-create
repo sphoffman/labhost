@@ -129,13 +129,13 @@ while read -r name mac addr; do
         "$name" \
         up
 
-    sudo sysctl -w \
-        "net.ipv4.conf.${name}.arp_ignore=1" \
-        >/dev/null
+    if [[ "$(sysctl -n "net.ipv4.conf.${name}.arp_ignore" 2>/dev/null || true)" != "1" ]]; then
+        sudo sysctl -w "net.ipv4.conf.${name}.arp_ignore=1" >/dev/null
+    fi
 
-    sudo sysctl -w \
-        "net.ipv4.conf.${name}.arp_announce=2" \
-        >/dev/null
+    if [[ "$(sysctl -n "net.ipv4.conf.${name}.arp_announce" 2>/dev/null || true)" != "2" ]]; then
+        sudo sysctl -w "net.ipv4.conf.${name}.arp_announce=2" >/dev/null
+    fi
 
     created=$((created + 1))
 
