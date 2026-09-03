@@ -19,6 +19,14 @@ if [[ "$cmd" == "labctl" && "${1:-}" == "lab-reset" ]]; then
     exec /usr/local/bin/lab-reset "$@"
 fi
 
+# pc-phone-create has a public convergence wrapper that validates runtime state
+# before deciding an object is already present. Route the explicit labctl form
+# through that same wrapper so both entry points have identical semantics.
+if [[ "$cmd" == "labctl" && "${1:-}" == "pc-phone-create" ]]; then
+    shift
+    exec /usr/local/bin/pc-phone-create "$@"
+fi
+
 # Friendly commands such as ip-set are symlinks to this dispatcher.  Feed the
 # invoked command name to the core as labctl's first argument so the existing
 # command dispatch semantics remain unchanged.
