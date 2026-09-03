@@ -24,7 +24,7 @@ FROM debian:13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENV LABHOST_VERSION="1.4-dev13"
+ENV LABHOST_VERSION="1.4-dev14"
 
 # Avoid interactive package prompts.
 RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' \
@@ -106,19 +106,21 @@ COPY bin/lab-help /usr/local/bin/lab-help
 COPY bin/lab-reset /usr/local/bin/lab-reset
 COPY bin/dhcp-leases /usr/local/bin/dhcp-leases
 COPY bin/pc-phone-create /usr/local/bin/pc-phone-create
+COPY bin/dhcpcd /usr/local/sbin/dhcpcd
 COPY lib/pc_phone_lldp.py /usr/local/lib/labhost/pc_phone_lldp.py
 COPY entrypoint.sh /usr/local/bin/labhost-entrypoint
 COPY README.md /usr/local/share/labhost/README.md
 COPY motd /etc/motd
 
 # labctl is the common implementation. A few commands use dedicated wrappers
-# where restart convergence, reset safety, or presentation needs extra logic.
+# where restart convergence, reset safety, DHCP identity, or presentation needs extra logic.
 RUN chmod 0755 \
         /usr/local/bin/labctl \
         /usr/local/bin/lab-help \
         /usr/local/bin/lab-reset \
         /usr/local/bin/dhcp-leases \
         /usr/local/bin/pc-phone-create \
+        /usr/local/sbin/dhcpcd \
         /usr/local/bin/labhost-entrypoint \
         /usr/local/lib/labhost/pc_phone_lldp.py \
     && for cmd in \
