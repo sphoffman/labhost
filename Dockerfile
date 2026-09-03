@@ -23,7 +23,7 @@ FROM debian:13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENV LABHOST_VERSION="1.4-dev16"
+ENV LABHOST_VERSION="1.4-dev17"
 
 RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' | debconf-set-selections \
     && echo 'iperf3 iperf3/start_daemon boolean false' | debconf-set-selections \
