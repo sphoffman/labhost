@@ -23,7 +23,7 @@ FROM debian:13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENV LABHOST_VERSION="1.4-dev21"
+ENV LABHOST_VERSION="1.4-dev22"
 
 RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' | debconf-set-selections \
     && echo 'iperf3 iperf3/start_daemon boolean false' | debconf-set-selections \
@@ -90,8 +90,11 @@ alias neigh='ip neigh'
 alias ports='ss -lntup'
 EOF
 
-RUN printf '%s\n' 'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' > /etc/profile.d/labhost-path.sh \
-    && chmod 0644 /etc/profile.d/labhost-path.sh
+RUN printf '%s\n' \
+        'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+        "export LABHOST_VERSION=\"${LABHOST_VERSION}\"" \
+        > /etc/profile.d/labhost-env.sh \
+    && chmod 0644 /etc/profile.d/labhost-env.sh
 
 EXPOSE 22/tcp 5001/tcp 5001/udp 5201/tcp 5201/udp 8000/tcp 8080/tcp 8443/tcp
 ENTRYPOINT ["/usr/local/bin/labhost-entrypoint"]

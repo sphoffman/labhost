@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-IMAGE="${1:-labhost:1.4-dev21}"
+IMAGE="${1:-labhost:1.4-dev22}"
 NAME="${LABHOST_SMOKE_NAME:-labhost-smoke}"
 
 TMPDIR="$(mktemp -d)"
