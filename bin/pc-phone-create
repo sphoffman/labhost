@@ -82,7 +82,7 @@ fi
 
 # Delegate construction directly to the internal core. LABHOST_INTENT_DIR is
 # exported above so the core records working intent under /run, never the old
-# persistent /config/.labhost path. The dhcpcd shim already supplies stable
+# obsolete persistent intent path. The dhcpcd shim already supplies stable
 # Ethernet client IDs for pp-*-pc interfaces, so no DHCP reacquire is needed.
 if (( dhcp )); then
     exec "$CORE" pc-phone-create "$parent"

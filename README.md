@@ -1,53 +1,47 @@
-# labhost v1.3 — Containerlab Network Swiss Army Knife
+# labhost v1.4 — Containerlab Network Swiss Army Knife
 
 `labhost` is a reusable Linux endpoint/test appliance for Containerlab. It is intentionally tool-heavy: the goal is to drop it into a topology and already have the troubleshooting, traffic-generation, multicast, packet-capture, service-emulation, VLAN/LAG, VRF, persistence, and impairment tools you need.
 
-## What changed in v1.3
+## What changed in v1.4
 
-Major v1.3 additions:
+v1.4 keeps the v1.3 networking, capture, traffic-generation, impairment, VRF,
+VLAN, QinQ, LAG, multicast, and service helpers, and adds:
 
-- Automatic management VRF:
-  - `eth0` is placed in `vrf-mgmt`
-  - routing table `4094`
-  - management default route is restored automatically
-  - `net.ipv4.tcp_l3mdev_accept=1` is enabled so SSH continues to work
-- Main routing table remains available for normal lab interfaces such as `eth1`, `eth2`, bonds, VLANs, and QinQ.
-- User-created VRF helpers and README examples.
-- Persistent Linux network configuration:
-  - `lab-save`
-  - `lab-save --dry-run`
-  - `lab-config`
-  - automatic execution of `/config/<hostname>.sh` at startup
-- Self-documenting helper commands:
-  - `lab-help <command>`
-  - `<command> --help`
-  - `<command> -h`
-  - invoking a helper without required arguments shows useful syntax.
-- `lab-status` cleans Containerlab peer suffixes such as `eth1@if57` to display simply as `eth1`.
-- `lab-status` includes VRF state and quick documentation pointers.
-- `mcast-send` now defaults multicast TTL to `32`.
-- New `send-tcp` helper.
-- `clients-create` accepts either a starting host offset or a literal starting IP address.
-- Shared `/config` and `/pcaps` directories designed for Containerlab bind mounts.
+- Deterministic, host-aware synthetic clients with continuation numbering,
+  per-client ARP isolation, status, ARP, ping, and traffic helpers.
+- First-class DHCP client intent for physical and VLAN interfaces.
+- Persistent multi-pool dnsmasq DHCP server helpers and a readable
+  `dhcp-leases` viewer.
+- PC-behind-LLDP-MED-phone emulation with deterministic PC/phone identities,
+  voice-VLAN discovery, bulk creation, and rich status.
+- Hardened `lab-reset` behavior that removes derived dataplane state without
+  deleting physical Containerlab dataplane interfaces.
+- Runtime high-level intent under `/run/labhost/intents`, converted by
+  `lab-save` into the sole persistent authority,
+  `/config/<hostname>.sh`.
+- A default MTU of 9000 on physical dataplane interfaces (`eth1+`), with
+  `LABHOST_DATA_MTU` available as an override.
+
+The automatic management VRF remains `vrf-mgmt`, routing table 4094. The
+management interface `eth0` is never treated as a dataplane interface.
 
 ---
 
 # Build
 
-The image build files live outside the Git-managed lab repository:
+The canonical image source is `/storage/Labs/images/labhost/`. Build from
+the repository root so the Docker context is correct:
 
 ```bash
-cd /storage/images/labhost-1.3
-docker build -t labhost:1.3 .
+cd /storage/Labs
+git switch labhost-phase3r4-r3
+git pull --ff-only
+docker build -t labhost:1.4-dev21 images/labhost
 ```
 
-Do not replace `labhost:latest` until v1.3 has been validated in a real lab.
-
-After validation:
-
-```bash
-docker tag labhost:1.3 labhost:latest
-```
+Do not replace `labhost:latest`, build the final `labhost:1.4` image, merge
+to `main`, or create the `labhost-v1.4` tag until final regression and
+release verification have passed.
 
 ## Host bonding support
 
@@ -82,7 +76,7 @@ Because bonding is loaded by the host kernel, every labhost container can use LA
 ## Quick validation
 
 ```bash
-./smoke-test.sh labhost:1.3
+images/labhost/smoke-test.sh labhost:1.4-dev21
 ```
 
 ---
@@ -195,7 +189,7 @@ A reusable labhost node should look like:
 ```yaml
 host4:
   kind: linux
-  image: labhost:1.3
+  image: labhost:1.4-dev21
   binds:
     - ./configs:/config
     - ./pcaps:/pcaps
@@ -238,7 +232,7 @@ docker run -d \
   -v "$(pwd)/configs:/config" \
   -v "$(pwd)/pcaps:/pcaps" \
   -e LAB_PASSWORD=lab \
-  labhost:1.3
+  labhost:1.4-dev21
 ```
 
 Docker will choose an available localhost port for SSH. Find it with:
@@ -304,7 +298,7 @@ Packet captures under `pcaps/` are intentionally ignored by the lab repository `
 
 # Management VRF design
 
-labhost v1.3 automatically treats `eth0` as management-only.
+labhost v1.4 automatically treats `eth0` as management-only.
 
 At startup:
 
@@ -446,114 +440,65 @@ The automatic management VRF is protected from normal delete/remove helpers.
 
 # Configuration persistence
 
-Containerlab destroys and recreates generic Linux containers. Runtime changes made only inside the container are otherwise lost after lab destruction.
+Containerlab destroys and recreates generic Linux containers. labhost therefore
+uses one deliberately simple persistence boundary:
 
-labhost v1.3 persists the **supported resulting Linux network state**, not the command history used to create it.
-
-You may configure the host with:
-
-```bash
-ip-set ...
+```text
+interactive helper
+    -> current Linux state + /run/labhost/intents
+    -> lab-save
+    -> /config/<hostname>.sh
+    -> startup replay after recreate
 ```
 
-or raw Linux commands such as:
+`/config/<hostname>.sh` is the **only authoritative persistent
+configuration**. High-level working intent is kept under
+`/run/labhost/intents`; it is runtime state and disappears with the
+container. The obsolete `/config/.labhost` tree is not read and must not
+influence behavior.
 
-```bash
-sudo ip addr add ...
-sudo ip route add ...
-```
+Interactive changes are not persistent until you run `lab-save`.
 
-`lab-save` inspects the resulting state.
-
-## Dry run
-
-Before saving:
+## Preview, save, and inspect
 
 ```bash
 lab-save --dry-run
-```
-
-This prints the generated startup script without modifying files.
-
-## Save
-
-```bash
 lab-save
-```
-
-The file is written to:
-
-```text
-/config/<hostname>.sh
-```
-
-For host `host1`:
-
-```text
-/config/host1.sh
-```
-
-Because `/config` is bind-mounted to `./configs`, the actual host-side file is:
-
-```text
-<lab>/configs/host1.sh
-```
-
-If a previous startup script exists, it is backed up as:
-
-```text
-host1.sh.bak
-```
-
-## Startup restore
-
-At container startup, the entrypoint automatically looks for:
-
-```text
-/config/<hostname>.sh
-```
-
-and executes it if present.
-
-The startup file is an ordinary shell script and may be edited manually.
-
-## Inspect or edit startup configuration
-
-Display:
-
-```bash
 lab-config
-```
-
-Show the path:
-
-```bash
 lab-config path
-```
-
-Edit:
-
-```bash
 lab-config edit
 ```
 
-## State intended for persistence
+For host `host1`, `lab-save` writes `/config/host1.sh`. With the
+recommended bind mount, that is `<lab>/configs/host1.sh` on the Containerlab
+host. An existing script is backed up as `host1.sh.bak`.
 
-`lab-save` is designed to reconstruct supported network state such as:
+At startup the entrypoint executes `/config/<hostname>.sh`. High-level
+commands in that script recreate both the live object and its runtime intent,
+so a later `lab-save` continues to preserve the abstraction.
 
-- IPv4/IPv6 addresses
-- routes/default routes
-- VLANs
-- QinQ
-- bonds/LAGs
-- user-created VRFs
-- VRF routes
-- MTUs
-- NetEm state where it can be safely reconstructed
+## What lab-save preserves
 
-The automatic `vrf-mgmt` and table `4094` are recreated by the entrypoint and are not written into startup configuration.
+`lab-save` reconstructs supported state including IPv4/IPv6 addresses,
+routes, VLANs, QinQ, LAGs, user VRFs and VRF routes, non-default MTUs, NetEm
+state, synthetic clients, DHCP client intent, DHCP pools/server state, and
+PC/phone intent.
 
-Runtime applications/processes such as `iperf-server`, `mcast-join`, or `http-server` are not automatically inferred as persistent configuration. Add them manually to the startup script if you intentionally want them launched at boot.
+For high-level or dynamic objects, it saves intent rather than incidental
+derived state:
+
+- DHCP is saved as `ip-set <iface> dhcp` or
+  `vlan-create <parent> <vid> dhcp`; leases and learned routes are not frozen.
+- DHCP pool definitions and enabled server state are saved; active leases are
+  not.
+- Synthetic clients and PC/phone objects are saved as their creation commands,
+  not as derived macvlan/VLAN/DHCP state.
+- MTU 9000 is the dataplane default and is omitted; only deviations are saved.
+
+The entrypoint recreates `vrf-mgmt` and table 4094, so management state is
+not written into the startup script. Runtime services such as
+`iperf-server`, `mcast-join`, and `http-server` are not inferred; add
+such commands manually to the startup script only when deliberately desired.
 
 ---
 
@@ -723,12 +668,17 @@ route-del 10.20.0.0/16
 default-gw 10.1.1.1 eth1
 
 mac-set eth1 02:00:00:00:00:10
-mtu-set eth1 9000
+mtu-set eth1 1500
+mtu-all 9000
 
 link-down eth1
 link-up eth1
 link-flap eth1 5
 ```
+
+`eth1` and higher physical dataplane interfaces default to MTU 9000.
+Override the image-wide default with `LABHOST_DATA_MTU`. `lab-save` omits
+interfaces at the default and records only MTU deviations.
 
 `link-flap` is useful for LACP, EVPN, BFD, redundancy, and convergence demonstrations.
 
@@ -1103,14 +1053,22 @@ Literal starting IP:
 clients-create eth1 20 10.100.0.0/24 10.100.0.100
 ```
 
-Inspect/delete:
+Inspect and exercise them:
 
 ```bash
 clients-list
+clients-status
+clients-arp
+clients-ping
+clients-traffic
 clients-delete
 ```
 
-Each client is a unique macvlan interface with its own MAC and IP in the same Linux namespace. This is useful for MAC/IP learning, EVPN advertisements, ARP tables, and lightweight endpoint scale.
+Each client is a unique macvlan interface with a deterministic, host-aware MAC
+and its own IP in the same Linux namespace. Numbering continues across repeated
+creation commands. Per-client ARP controls reduce Linux weak-host/ARP-flux
+behavior so the interfaces act like independent endpoints during switching and
+EVPN tests.
 
 It is not equivalent to independent VMs or separate network namespaces.
 
@@ -1311,34 +1269,25 @@ Use **TRex** when the goal becomes serious packet-rate/performance generation.
 - `vrf-mgmt` automatically uses routing table `4094`.
 - NetEm applies to egress.
 - `clients-create` uses macvlan rather than nested namespaces so the container can remain limited to `NET_ADMIN` + `NET_RAW`.
-- `lab-save` captures supported resulting network state, not arbitrary filesystem/process state.
+- `lab-save` captures supported state and high-level intent, not arbitrary filesystem/process state.
 - The startup configuration is an ordinary shell script and may be manually extended.
 - `lab-reset` is intentionally conservative and preserves the management VRF/path.
 - Default `lab/lab` credentials are intended only for isolated lab environments.
 
 
-## v1.4 Phase 1B: DHCP intent
+## DHCP clients, server, and leases
 
-IPv4 DHCP is now a first-class configuration mode for ordinary interfaces and
-802.1Q VLAN interfaces.
+IPv4 DHCP is a first-class mode for physical and 802.1Q VLAN interfaces:
 
 ```bash
 ip-set eth1 dhcp
 vlan-create eth1 100 dhcp
 ```
 
-`lab-save` records the *intent* to use DHCP rather than converting the current
-lease into a static address. For example, a leased address on `eth1` is saved
-as `ip-set eth1 dhcp`, and a DHCP VLAN is saved as
-`vlan-create eth1 100 dhcp`.
+Dataplane DHCP does not overwrite management DNS configuration. `lab-save`
+records DHCP intent, not the current lease, address, or learned routes.
 
-Dataplane DHCP deliberately does not overwrite the container's management DNS
-configuration. This keeps Containerlab management name resolution independent
-of test-network DHCP behavior.
-
-## v1.4-dev3 persistent DHCP server helpers
-
-Labhost can serve multiple explicit DHCP pools using its built-in dnsmasq. DHCP service is opt-in and never starts unless `dhcp-server-start` has been configured.
+Create one or more dnsmasq pools and explicitly start the server:
 
 ```bash
 dhcp-pool-create eth10.100 192.168.100.100 192.168.100.199 255.255.255.0 192.168.100.1
@@ -1346,54 +1295,36 @@ dhcp-pool-create eth10.200 192.168.200.100 192.168.200.199 255.255.255.0 192.168
 dhcp-pool-list
 dhcp-server-start
 dhcp-server-status
+dhcp-leases
+dhcp-leases --raw
 ```
 
-`lab-save` persists the pool definitions and enabled state as high-level intent. DHCP leases themselves remain runtime state and are not converted into static client addresses.
+`dhcp-leases` displays active leases in a readable, numerically IP-sorted
+table with formatted expiry times. `--raw` prints the dnsmasq lease file.
+Pool definitions and server enabled state persist through `lab-save`; leases
+do not.
 
-## v1.4 Phase 3: PC behind LLDP-MED phone
+## PC behind an LLDP-MED phone
 
-`pc-phone-create <parent>` creates a deterministic PC MAC on the native/untagged
-side and a deterministic phone identity on the physical link. A per-port LLDP
-agent advertises the phone and listens for an LLDP-MED Voice Network Policy.
-When a tagged voice policy is learned, labhost creates a tagged voice interface
-using the same phone MAC and requests DHCP on both PC and voice sides by default.
+`pc-phone-create <parent>` models a PC on the native VLAN behind an IP phone.
+It creates deterministic PC and phone MACs, runs a per-port phone LLDP agent,
+learns the LLDP-MED voice policy, and creates the tagged voice interface. DHCP
+runs on the PC and phone sides by default:
 
-Commands:
+```bash
+pc-phone-create eth1
+pc-phone-status eth1
+pc-phone-reprovision eth1
+pc-phone-delete eth1
+```
 
-    pc-phone-create eth1
-    pc-phone-status eth1
-    pc-phone-reprovision eth1
-    pc-phone-delete eth1
+Use `--no-dhcp` to test LLDP-MED without requesting leases:
 
-Use `pc-phone-create eth1 --no-dhcp` when testing LLDP-MED without DHCP service.
-`lab-save` persists the high-level `pc-phone-create` intent, not derived VLAN,
-lease, or runtime agent state.
+```bash
+pc-phone-create eth1 --no-dhcp
+```
 
-### v1.4-dev5 / Phase 3r1
-
-PC/phone ports now take ownership of LLDP on their parent interface: normal labhost lldpd transmission is disabled on that port while the simulated phone agent is active. Global L3 addresses are flushed from the parent so its underlying container MAC does not behave as an endpoint. The simulated phone emits a brief untagged ARP-probe startup burst using its deterministic phone MAC; this allows a switch using persistent MAC learning to retain the phone MAC in the native VLAN while the same phone MAC is used for tagged voice traffic learned from LLDP-MED. `pc-phone-delete` restores normal lldpd transmit/receive behavior on the parent.
-
-
-### v1.4-dev6 / Phase 3r2
-
-Corrected simulated-phone LLDP encoding: System Capabilities is now the required 4-byte supported/enabled pair, Telephone is advertised instead of Station Only, and LLDP-MED endpoint capabilities now advertise both LLDP-MED capabilities and Network Policy support.
-
-### v1.4-dev7 / Phase 3r3
-
-A PC/phone parent interface now takes the deterministic phone MAC while the abstraction is active. The original Containerlab-assigned parent MAC is saved under runtime state and restored by `pc-phone-delete`. This prevents kernel-originated untagged traffic such as IPv6 Router Solicitation from leaking a fourth MAC into the native VLAN; such traffic now naturally uses the phone MAC. The PC macvlan retains its deterministic PC MAC and the LLDP-MED-created tagged voice interface uses the same deterministic phone MAC as the parent.
-
-## v1.4 Phase 3r4: bulk PC/phone endpoints and richer status
-
-`pc-phone-create` is idempotent: if an object already exists on a parent, the
-command reports that fact and leaves its live LLDP/DHCP state untouched. Use
-`pc-phone-reprovision <parent>` when an intentional teardown/rebuild is wanted.
-Phase 3r4 also fixes reprovision so it preserves the high-level creation intent
-before the delete step removes the persisted intent file.
-
-`pc-phone-status [parent]` now reports PC MAC/IP and phone MAC/IP, plus the
-learned LLDP-MED voice VLAN, tagged state, 802.1p priority, and DSCP.
-
-Bulk creation/status are available with:
+Bulk operations are also available:
 
 ```bash
 pc-phones-create --all
@@ -1402,10 +1333,38 @@ pc-phones-create eth1 eth3
 pc-phones-status
 ```
 
-`--all` selects Containerlab dataplane interfaces named `eth1`, `eth2`, ... and
-always excludes the management interface `eth0`. Existing PC/phone objects are
-not disturbed by a repeated bulk create.
+`--all` selects physical dataplane interfaces `eth1+` and always excludes
+management `eth0`. Creation is idempotent; use reprovision only for an
+intentional teardown/rebuild.
 
-### Phase 3r4-r2 reset semantics
+While active, the parent uses the deterministic phone MAC, ordinary lldpd is
+suppressed on that port, and the learned tagged voice identity uses the same
+phone MAC. The PC macvlan has its own deterministic PC MAC. Delete/reset
+restores the original parent MAC and normal lldpd behavior.
 
-`lab-reset` clears current dataplane runtime state plus unsaved high-level labhost intent (PC/phone objects, synthetic clients, DHCP client/server intent, and `mtu-all` intent) while preserving the Containerlab management path and `/config/<hostname>.sh`. A later container restart can therefore restore the last configuration captured by `lab-save`.
+The dhcpcd shim supplies stable Ethernet Client-ID `01:<MAC>` for simulated
+PCs and phones, while preserving an explicitly supplied Client-ID. This keeps
+DHCP identity deterministic across recreation.
+
+`lab-save` persists the high-level `pc-phone-create` command. Derived VLAN,
+agent, and lease state are rebuilt at startup rather than frozen.
+
+## Hardened lab-reset
+
+```bash
+lab-reset
+labctl lab-reset
+```
+
+Reset removes current derived dataplane state and unsaved high-level intent,
+including PC/phone objects, synthetic clients, DHCP client/server intent,
+VLANs, bonds, user VRFs, NetEm, and MTU overrides. It preserves:
+
+- physical Containerlab dataplane interfaces `eth1+`;
+- `eth0`, `vrf-mgmt`, table 4094, and the management path;
+- `/config/<hostname>.sh`.
+
+It restores original physical MAC addresses and normal LLDP behavior. Because
+the saved startup script remains, a later recreate can restore the last
+configuration explicitly captured with `lab-save`.
+

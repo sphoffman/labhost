@@ -29,7 +29,7 @@ mkdir -p /run/labhost/intents
 chown -R lab:lab /run/labhost/intents
 
 #
-# labhost v1.3 management VRF
+# labhost v1.4 management VRF
 #
 # eth0 remains the Containerlab management interface, but is moved
 # into vrf-mgmt so the main routing table can be used independently

@@ -14,7 +14,7 @@ MGMT_VRF="${LABHOST_MGMT_VRF:-vrf-mgmt}"
 MGMT_TABLE="${LABHOST_MGMT_TABLE:-4094}"
 MGMT_IF="${LABHOST_MGMT_IF:-eth0}"
 DEFAULT_DATA_MTU="${LABHOST_DATA_MTU:-9000}"
-INTENT_DIR="${LABHOST_INTENT_DIR:-$CONFIG_DIR/.labhost}"
+INTENT_DIR="${LABHOST_INTENT_DIR:-$STATE/intents}"
 CLIENT_INTENT_DIR="$INTENT_DIR/clients"
 DHCP_INTENT_DIR="$INTENT_DIR/dhcp"
 DHCP_SERVER_INTENT_DIR="$INTENT_DIR/dhcp-server"
@@ -196,7 +196,9 @@ EOF
       ;;
       lab-reset) cat <<'EOF'
 Usage: lab-reset
-Conservatively removes helper-created/test state while preserving eth0 and vrf-mgmt.
+Removes derived dataplane state and unsaved runtime intent while preserving
+physical eth1+ interfaces, eth0, vrf-mgmt/table 4094, the management path,
+and /config/<hostname>.sh. Restores original physical MACs and LLDP behavior.
 EOF
       ;;
       lab-save) cat <<'EOF'
@@ -212,8 +214,11 @@ If a startup file already exists, lab-save creates <hostname>.sh.bak first.
 
 Automatically captured where reconstructable:
   IPv4/IPv6 addresses, main-table routes, VLANs/QinQ, bonds/LAGs,
-  user VRFs and VRF routes, non-default MTUs, NetEm qdiscs.
+  user VRFs and VRF routes, non-default MTUs, NetEm qdiscs,
+  synthetic-client intent, DHCP client/pool/server intent, PC/phone intent.
 
+High-level intent is read from /run/labhost/intents. Dynamic DHCP leases,
+learned routes, and derived PC/phone state are not frozen into the script.
 The automatic vrf-mgmt/table 4094 is recreated by the entrypoint and is not saved.
 EOF
       ;;

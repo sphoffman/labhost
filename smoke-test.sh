@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-IMAGE="${1:-labhost:1.3}"
+IMAGE="${1:-labhost:1.4-dev21}"
 NAME="${LABHOST_SMOKE_NAME:-labhost-smoke}"
 
 TMPDIR="$(mktemp -d)"
@@ -32,7 +32,7 @@ section() {
     echo "============================================================"
 }
 
-section "LABHOST v1.3 SMOKE TEST"
+section "LABHOST v1.4 SMOKE TEST"
 echo "Image: $IMAGE"
 
 docker image inspect "$IMAGE" >/dev/null 2>&1 \
@@ -103,7 +103,7 @@ for cmd in \
     docker exec "$NAME" sh -lc "command -v '$cmd' >/dev/null" \
         || fail "Helper '$cmd' was not found."
 done
-pass "v1.3 helper symlinks are present"
+pass "v1.4 helper symlinks are present"
 
 docker exec "$NAME" lab-help >/dev/null \
     || fail "lab-help failed."
@@ -284,7 +284,7 @@ done
 pass "Hostname-based startup configuration executes automatically"
 
 section "RESULT"
-echo "All labhost v1.3 smoke tests passed."
+echo "All labhost v1.4 smoke tests passed."
 echo
 echo "Image size:"
 docker image inspect "$IMAGE" --format '{{.Size}} bytes'
