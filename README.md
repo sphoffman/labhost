@@ -27,23 +27,39 @@ management interface `eth0` is never treated as a dataplane interface.
 
 ---
 
-# Build
+# Install
 
-The canonical image source is `/storage/Labs/images/labhost/`. Build from
-the repository root so the Docker context is correct:
+## Pull the published image
+
+The recommended installation method is to pull the versioned image from the
+GitHub Container Registry:
 
 ```bash
-cd /storage/Labs
-git switch labhost-phase3r4-r3
-git pull --ff-only
-docker build -t labhost:1.4 images/labhost
+docker pull ghcr.io/sphoffman/labhost:1.4
 ```
 
-Validate the versioned image before updating `labhost:latest`:
+The `latest` tag is also available:
 
 ```bash
-images/labhost/smoke-test.sh labhost:1.4
-docker tag labhost:1.4 labhost:latest
+docker pull ghcr.io/sphoffman/labhost:latest
+```
+
+For reproducible labs, prefer the versioned `1.4` tag over `latest`.
+
+## Build locally
+
+To build LabHost from source instead:
+
+```bash
+git clone https://github.com/sphoffman/labhost.git
+cd labhost
+docker build -t labhost:1.4 .
+```
+
+Validate a locally built image with:
+
+```bash
+./smoke-test.sh labhost:1.4
 ```
 
 ## Host bonding support
@@ -79,7 +95,7 @@ Because bonding is loaded by the host kernel, every labhost container can use LA
 ## Quick validation
 
 ```bash
-images/labhost/smoke-test.sh labhost:1.4
+./smoke-test.sh ghcr.io/sphoffman/labhost:1.4
 ```
 
 ---
@@ -192,7 +208,7 @@ A reusable labhost node should look like:
 ```yaml
 host4:
   kind: linux
-  image: labhost:1.4
+  image: ghcr.io/sphoffman/labhost:1.4
   binds:
     - ./configs:/config
     - ./pcaps:/pcaps
@@ -235,7 +251,7 @@ docker run -d \
   -v "$(pwd)/configs:/config" \
   -v "$(pwd)/pcaps:/pcaps" \
   -e LAB_PASSWORD=lab \
-  labhost:1.4
+  ghcr.io/sphoffman/labhost:1.4
 ```
 
 Docker will choose an available localhost port for SSH. Find it with:

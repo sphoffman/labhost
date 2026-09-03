@@ -8,7 +8,7 @@ topology:
   nodes:
     client1:
       kind: linux
-      image: labhost:latest
+      image: ghcr.io/sphoffman/labhost:1.4
       mgmt-ipv4: 172.20.20.101
       env:
         LAB_PASSWORD: lab
@@ -22,7 +22,7 @@ topology:
 
     client2:
       kind: linux
-      image: labhost:latest
+      image: ghcr.io/sphoffman/labhost:1.4
       mgmt-ipv4: 172.20.20.102
       env:
         LAB_PASSWORD: lab
