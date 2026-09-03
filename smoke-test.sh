@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-IMAGE="${1:-labhost:1.4-dev23}"
+IMAGE="${1:-labhost:1.4-dev24}"
 NAME="${LABHOST_SMOKE_NAME:-labhost-smoke}"
 
 TMPDIR="$(mktemp -d)"
@@ -79,8 +79,8 @@ pass "Docker assigned localhost SSH port $PORT"
 section "VERSION / PATH / CORE BINARIES"
 
 version="$(docker exec "$NAME" sh -lc 'printf "%s" "${LABHOST_VERSION:-unknown}"')"
-[[ "$version" == "1.4-dev23" ]] || fail "Expected LABHOST_VERSION=1.4-dev23, got '$version'."
-pass "LABHOST_VERSION=1.4-dev23"
+[[ "$version" == "1.4-dev24" ]] || fail "Expected LABHOST_VERSION=1.4-dev24, got '$version'."
+pass "LABHOST_VERSION=1.4-dev24"
 
 path_value="$(docker exec "$NAME" sh -lc 'printf "%s" "$PATH"')"
 echo "PATH=$path_value"

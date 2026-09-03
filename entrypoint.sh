@@ -78,6 +78,17 @@ if ip link show "$MGMT_IF" >/dev/null 2>&1; then
     fi
 fi
 
+# Containerlab attaches dataplane veth interfaces after starting the container.
+# Allow that setup to settle before applying dataplane defaults and replaying
+# persistent configuration, so late link setup cannot overwrite restored state.
+LINK_SETTLE_SECONDS="${LABHOST_LINK_SETTLE_SECONDS:-3}"
+if [[ "$LINK_SETTLE_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    sleep "$LINK_SETTLE_SECONDS"
+else
+    echo "labhost: WARNING: invalid LABHOST_LINK_SETTLE_SECONDS='$LINK_SETTLE_SECONDS'; using 3." >&2
+    sleep 3
+fi
+
 DATA_MTU="${LABHOST_DATA_MTU:-9000}"
 
 while read -r iface; do
