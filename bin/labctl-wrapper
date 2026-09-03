@@ -4,6 +4,12 @@ set -euo pipefail
 cmd="$(basename "$0")"
 core=/usr/local/lib/labhost/labctl
 
+# High-level intent files are working metadata used by lab-save to reconstruct
+# commands that cannot be inferred reliably from Linux runtime state.  Keep
+# them under /run so creating an object does not make it persistent by itself.
+# /config/<hostname>.sh remains the single authoritative saved configuration.
+export LABHOST_INTENT_DIR="${LABHOST_INTENT_DIR:-/run/labhost/intents}"
+
 # Keep exactly one authoritative reset implementation.  The public lab-reset
 # command is the hardened, regression-tested path; make `labctl lab-reset`
 # converge on that same implementation rather than the legacy case statement
