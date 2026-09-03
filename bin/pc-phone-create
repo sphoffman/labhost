@@ -7,6 +7,7 @@ PC_PHONE_INTENT_DIR="$INTENT_DIR/pc-phones"
 PC_PHONE_RUN_DIR="$STATE/pc-phones"
 MGMT_IF="${LABHOST_MGMT_IF:-eth0}"
 MGMT_VRF="${LABHOST_MGMT_VRF:-vrf-mgmt}"
+CORE=/usr/local/lib/labhost/labctl
 
 usage() {
     cat <<'EOF'
@@ -42,7 +43,7 @@ pidfile="$PC_PHONE_RUN_DIR/${parent}.pid"
 pc="pp-${parent}-pc"
 pc="${pc:0:15}"
 
-read -r pc_mac phone_mac < <(python3 - "$parent" "$(hostname -s)" <<'PY'
+read -r _pc_mac phone_mac < <(python3 - "$parent" "$(hostname -s)" <<'PY'
 import hashlib,sys
 p,h=sys.argv[1:]
 def m(role):
@@ -78,12 +79,11 @@ if [[ -r "$intent" ]]; then
     /usr/local/bin/pc-phone-delete "$parent" >/dev/null
 fi
 
+# Delegate construction directly to the internal core. The dhcpcd shim already
+# supplies deterministic Ethernet client IDs for pp-*-pc interfaces, so no
+# post-create DHCP teardown/reacquire is needed here.
 if (( dhcp )); then
-    /usr/local/bin/labctl pc-phone-create "$parent"
-
-    sudo dhcpcd -k "$pc" >/dev/null 2>&1 || true
-    sudo ip -4 addr flush dev "$pc" scope global 2>/dev/null || true
-    sudo dhcpcd -4 -q -b -C resolv.conf -I "01:${pc_mac,,}" "$pc" >/dev/null 2>&1 || true
+    exec "$CORE" pc-phone-create "$parent"
 else
-    exec /usr/local/bin/labctl pc-phone-create "$parent" --no-dhcp
+    exec "$CORE" pc-phone-create "$parent" --no-dhcp
 fi
