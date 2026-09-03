@@ -24,7 +24,7 @@ FROM debian:13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENV LABHOST_VERSION="1.4-dev14"
+ENV LABHOST_VERSION="1.4-dev15"
 
 # Avoid interactive package prompts.
 RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' \
@@ -101,26 +101,30 @@ RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' \
 
 COPY --from=mcjoin-builder /usr/local/ /usr/local/
 
-COPY bin/labctl /usr/local/bin/labctl
+# Keep the monolithic implementation as an internal core and put a small
+# dispatcher at /usr/local/bin/labctl.  This lets `labctl lab-reset` route to
+# the same hardened reset implementation as the standalone `lab-reset` command.
+COPY bin/labctl /usr/local/lib/labhost/labctl
+COPY bin/labctl-wrapper /usr/local/bin/labctl
 COPY bin/lab-help /usr/local/bin/lab-help
 COPY bin/lab-reset /usr/local/bin/lab-reset
 COPY bin/dhcp-leases /usr/local/bin/dhcp-leases
 COPY bin/pc-phone-create /usr/local/bin/pc-phone-create
-COPY bin/dhcpcd /usr/local/sbin/dhcpcd
 COPY lib/pc_phone_lldp.py /usr/local/lib/labhost/pc_phone_lldp.py
 COPY entrypoint.sh /usr/local/bin/labhost-entrypoint
 COPY README.md /usr/local/share/labhost/README.md
 COPY motd /etc/motd
 
-# labctl is the common implementation. A few commands use dedicated wrappers
-# where restart convergence, reset safety, DHCP identity, or presentation needs extra logic.
+# Friendly command names point at the dispatcher. Dedicated wrappers remain
+# dedicated where restart convergence, reset safety, or presentation needs
+# extra logic.
 RUN chmod 0755 \
+        /usr/local/lib/labhost/labctl \
         /usr/local/bin/labctl \
         /usr/local/bin/lab-help \
         /usr/local/bin/lab-reset \
         /usr/local/bin/dhcp-leases \
         /usr/local/bin/pc-phone-create \
-        /usr/local/sbin/dhcpcd \
         /usr/local/bin/labhost-entrypoint \
         /usr/local/lib/labhost/pc_phone_lldp.py \
     && for cmd in \
