@@ -6,7 +6,7 @@ CONFIG_DIR=/config
 MGMT_IF="${LABHOST_MGMT_IF:-eth0}"
 MGMT_VRF="${LABHOST_MGMT_VRF:-vrf-mgmt}"
 DEFAULT_DATA_MTU="${LABHOST_DATA_MTU:-9000}"
-INTENT_DIR="${LABHOST_INTENT_DIR:-$CONFIG_DIR/.labhost}"
+INTENT_DIR="${LABHOST_INTENT_DIR:-$STATE/intents}"
 CLIENT_INTENT_DIR="$INTENT_DIR/clients"
 DHCP_INTENT_DIR="$INTENT_DIR/dhcp"
 DHCP_SERVER_INTENT_DIR="$INTENT_DIR/dhcp-server"
@@ -29,8 +29,6 @@ EOF
 fi
 [[ $# -eq 0 ]] || { echo "ERROR: lab-reset takes no arguments." >&2; exit 2; }
 
-# Snapshot Containerlab dataplane interfaces before doing anything destructive.
-# These names are a hard preservation boundary for this reset.
 mapfile -t PHYSICAL_IFACES < <(
     for path in /sys/class/net/eth[1-9]*; do
         [[ -e "$path" ]] || continue
@@ -82,25 +80,19 @@ cleanup_phone_parent(){
     statefile="$PC_PHONE_RUN_DIR/${parent}.state"
     origmac="$PC_PHONE_RUN_DIR/${parent}.origmac"
     pc="pp-${parent}-pc"; pc="${pc:0:15}"
-
-    # Stop the LLDP-MED agent and wait for it to be gone before deleting any
-    # derived interface.  This prevents provisioning from racing reset.
     stop_pid_wait "$pidfile"
 
     voice_iface=""
     if [[ -r "$statefile" ]]; then
         unset vlan tagged priority dscp voice_iface
-        # shellcheck disable=SC1090
         source "$statefile"
     fi
 
-    # Stop DHCP on derived objects before deleting them.
     if [[ -n "${voice_iface:-}" && "$voice_iface" != "$parent" ]]; then
         sudo_if_needed dhcpcd -k "$voice_iface" >/dev/null 2>&1 || true
     fi
     sudo_if_needed dhcpcd -k "$pc" >/dev/null 2>&1 || true
 
-    # Hard rule: reset may delete only pp-* objects here, never the parent.
     if [[ -n "${voice_iface:-}" && "$voice_iface" != "$parent" ]]; then
         if [[ "$voice_iface" == pp-* ]]; then
             sudo_if_needed ip link del "$voice_iface" 2>/dev/null || true
@@ -110,7 +102,6 @@ cleanup_phone_parent(){
     fi
     [[ "$pc" == pp-* ]] && sudo_if_needed ip link del "$pc" 2>/dev/null || true
 
-    # Restore Containerlab's original MAC if the phone abstraction changed it.
     if [[ -r "$origmac" ]]; then
         original_mac="$(tr -d '[:space:]' <"$origmac")"
         if [[ "$original_mac" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
@@ -126,8 +117,6 @@ cleanup_phone_parent(){
 }
 
 echo 'Removing PC/phone objects...'
-# Build the cleanup set from both intent and runtime state, but only operate on
-# the protected physical interfaces captured at reset start.
 declare -A PHONE_PARENTS=()
 if [[ -d "$PC_PHONE_INTENT_DIR" ]]; then
     for f in "$PC_PHONE_INTENT_DIR"/*.conf; do
@@ -180,7 +169,6 @@ if compgen -G '/proc/net/bonding/*' >/dev/null; then
     for f in /proc/net/bonding/*; do
         bond="${f##*/}"
         is_protected "$bond" && continue
-        # Detach protected members before deleting the virtual bond.
         while read -r m; do
             [[ -n "$m" ]] || continue
             is_protected "$m" && sudo_if_needed ip link set "$m" nomaster 2>/dev/null || true
@@ -194,7 +182,6 @@ mapfile -t VRFS < <(ip -o link show type vrf 2>/dev/null | awk -F': ' '{print $2
 for v in "${VRFS[@]}"; do
     [[ -n "$v" ]] || continue
     is_protected "$v" && continue
-    # Detach protected physical members before deleting the VRF device.
     for i in "${PHYSICAL_IFACES[@]}"; do
         if ip -o link show master "$v" 2>/dev/null | grep -q " $i"; then
             sudo_if_needed ip link set "$i" nomaster 2>/dev/null || true
@@ -225,8 +212,6 @@ for i in "${PHYSICAL_IFACES[@]}"; do
 done
 rm -f "$MTU_ALL_INTENT" 2>/dev/null || true
 
-# This is the regression guard that r2 lacked. Every physical interface present
-# before reset must still exist with the same ifindex afterward.
 failed=0
 for i in "${PHYSICAL_IFACES[@]}"; do
     if ! exists "$i"; then
