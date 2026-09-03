@@ -1,0 +1,22 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ "${1:-}" == "dhcp-leases" ]]; then
+    cat <<'EOF'
+Usage:
+  dhcp-leases
+  dhcp-leases --raw
+
+Show active dnsmasq DHCP leases in a readable table.
+--raw prints the underlying dnsmasq lease file unchanged.
+EOF
+    exit 0
+fi
+
+if [[ $# -eq 0 ]]; then
+    /usr/local/bin/labctl lab-help | sed \
+        's/dhcp-server-stop dhcp-server-status tftp-server/dhcp-server-stop dhcp-server-status dhcp-leases tftp-server/'
+    exit 0
+fi
+
+exec /usr/local/bin/labctl lab-help "$@"
