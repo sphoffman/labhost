@@ -16,6 +16,10 @@ trap cleanup EXIT
 
 mkdir -p "$CONFIG_DIR" "$PCAP_DIR"
 
+# The smoke test may be launched with sudo. The bind-mounted directories must
+# remain writable by the image's unprivileged lab user.
+chmod 0777 "$CONFIG_DIR" "$PCAP_DIR"
+
 pass() {
     printf 'PASS: %s\n' "$*"
 }
