@@ -24,7 +24,7 @@ FROM debian:13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENV LABHOST_VERSION="1.4-dev11"
+ENV LABHOST_VERSION="1.4-dev12"
 
 # Avoid interactive package prompts.
 RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' \
@@ -104,17 +104,19 @@ COPY --from=mcjoin-builder /usr/local/ /usr/local/
 COPY bin/labctl /usr/local/bin/labctl
 COPY bin/lab-reset /usr/local/bin/lab-reset
 COPY bin/dhcp-leases /usr/local/bin/dhcp-leases
+COPY bin/pc-phone-create /usr/local/bin/pc-phone-create
 COPY lib/pc_phone_lldp.py /usr/local/lib/labhost/pc_phone_lldp.py
 COPY entrypoint.sh /usr/local/bin/labhost-entrypoint
 COPY README.md /usr/local/share/labhost/README.md
 COPY motd /etc/motd
 
 # labctl is the common implementation. Friendly command names are symlinks;
-# lab-reset and dhcp-leases are dedicated implementations.
+# reset, lease display, and restart-safe PC/phone creation use dedicated wrappers.
 RUN chmod 0755 \
         /usr/local/bin/labctl \
         /usr/local/bin/lab-reset \
         /usr/local/bin/dhcp-leases \
+        /usr/local/bin/pc-phone-create \
         /usr/local/bin/labhost-entrypoint \
         /usr/local/lib/labhost/pc_phone_lldp.py \
     && for cmd in \
@@ -136,7 +138,7 @@ RUN chmod 0755 \
         mcast-join mcast-send \
         http-server https-server tcp-listen udp-listen \
         dnsmasq-start dnsmasq-stop dhcp-pool-create dhcp-pool-delete dhcp-pool-list dhcp-server-start dhcp-server-stop dhcp-server-status tftp-server \
-        lldp-start lldp-show lldp-stop pc-phone-create pc-phone-delete pc-phone-status pc-phone-reprovision pc-phones-create pc-phones-status \
+        lldp-start lldp-show lldp-stop pc-phone-delete pc-phone-status pc-phone-reprovision pc-phones-create pc-phones-status \
         radius-test snmp-walk snmp-get \
         arp-watch nd-watch gratuitous-arp arp-clear \
         clients-create clients-delete clients-list clients-status clients-arp clients-ping clients-traffic endpoint-move \
