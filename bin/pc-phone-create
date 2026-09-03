@@ -80,10 +80,19 @@ if [[ -r "$intent" ]]; then
 fi
 
 # The labctl implementation performs the actual construction and records the
-# high-level persistent intent.  Calling it explicitly avoids recursion through
+# high-level persistent intent. Calling it explicitly avoids recursion through
 # this public convergence wrapper.
 if (( dhcp )); then
-    exec /usr/local/bin/labctl pc-phone-create "$parent"
+    /usr/local/bin/labctl pc-phone-create "$parent"
+
+    # dhcpcd normally builds a DHCPv4 client identifier from a host-wide DUID
+    # plus a per-interface IAID. That works, but the DUID is container-runtime
+    # state and can change after a fresh deployment. Reacquire the PC lease
+    # using the same explicit RFC2132 Ethernet client identifier scheme used
+    # by simulated phones: type 1 + deterministic endpoint MAC.
+    sudo dhcpcd -k "$pc" >/dev/null 2>&1 || true
+    sudo ip -4 addr flush dev "$pc" scope global 2>/dev/null || true
+    sudo dhcpcd -4 -q -b -C resolv.conf -I "01:${pc_mac,,}" "$pc" >/dev/null 2>&1 || true
 else
     exec /usr/local/bin/labctl pc-phone-create "$parent" --no-dhcp
 fi
