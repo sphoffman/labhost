@@ -3,6 +3,7 @@ set -euo pipefail
 
 STATE=/run/labhost
 INTENT_DIR="${LABHOST_INTENT_DIR:-$STATE/intents}"
+export LABHOST_INTENT_DIR="$INTENT_DIR"
 PC_PHONE_INTENT_DIR="$INTENT_DIR/pc-phones"
 PC_PHONE_RUN_DIR="$STATE/pc-phones"
 MGMT_IF="${LABHOST_MGMT_IF:-eth0}"
@@ -79,9 +80,10 @@ if [[ -r "$intent" ]]; then
     /usr/local/bin/pc-phone-delete "$parent" >/dev/null
 fi
 
-# Delegate construction directly to the internal core. The dhcpcd shim already
-# supplies deterministic Ethernet client IDs for pp-*-pc interfaces, so no
-# post-create DHCP teardown/reacquire is needed here.
+# Delegate construction directly to the internal core. LABHOST_INTENT_DIR is
+# exported above so the core records working intent under /run, never the old
+# persistent /config/.labhost path. The dhcpcd shim already supplies stable
+# Ethernet client IDs for pp-*-pc interfaces, so no DHCP reacquire is needed.
 if (( dhcp )); then
     exec "$CORE" pc-phone-create "$parent"
 else
