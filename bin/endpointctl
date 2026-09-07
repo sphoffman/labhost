@@ -1,0 +1,310 @@
+#!/bin/bash
+set -euo pipefail
+
+CMD="$(basename "$0")"
+if [[ "$CMD" == "endpointctl" ]]; then
+    CMD="${1:-help}"
+    shift || true
+fi
+
+sudo_if_needed(){ if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+iface_exists(){ ip link show "$1" >/dev/null 2>&1 || die "Interface '$1' does not exist."; }
+ipv4_of(){ ip -4 -o addr show dev "$1" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1; }
+mac_of(){ cat "/sys/class/net/$1/address" 2>/dev/null || true; }
+parent_of(){ ip -o link show "$1" 2>/dev/null | awk -F'@' '{print $2}' | awk -F': ' '{print $1}' | awk '{print $1}' | head -1; }
+
+endpoint_rows(){
+    local iface parent ip mac f voice_iface
+    while IFS= read -r iface; do
+        [[ -n "$iface" ]] || continue
+        parent="$(parent_of "$iface")"; ip="$(ipv4_of "$iface")"; mac="$(mac_of "$iface")"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$iface" synthetic client "${parent:-?}" "${ip:--}" "${mac:--}"
+    done < <(ip -o link show type macvlan 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -E '^cl[0-9]+$' | sort -V || true)
+
+    while IFS= read -r iface; do
+        [[ -n "$iface" ]] || continue
+        parent="$(parent_of "$iface")"; ip="$(ipv4_of "$iface")"; mac="$(mac_of "$iface")"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$iface" pc-phone pc "${parent:-?}" "${ip:--}" "${mac:--}"
+    done < <(ip -o link show type macvlan 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -E '^pp-.*-pc$' | sort -V || true)
+
+    for f in /run/labhost/pc-phones/*.state; do
+        [[ -r "$f" ]] || continue
+        parent="${f##*/}"; parent="${parent%.state}"
+        voice_iface=''
+        source "$f"
+        [[ -n "${voice_iface:-}" ]] || continue
+        ip link show "$voice_iface" >/dev/null 2>&1 || continue
+        ip="$(ipv4_of "$voice_iface")"; mac="$(mac_of "$voice_iface")"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$voice_iface" pc-phone phone "$parent" "${ip:--}" "${mac:--}"
+    done
+}
+
+selected_rows(){
+    local mode="${1:-all}" filter="${2:-}" iface type role parent ip mac
+    while IFS=$'\t' read -r iface type role parent ip mac; do
+        [[ -n "$iface" ]] || continue
+        [[ -z "$filter" || "$iface" == "$filter" ]] || continue
+        case "$mode" in
+            all) ;;
+            pcs) [[ "$role" == pc ]] || continue ;;
+            phones) [[ "$role" == phone ]] || continue ;;
+            clients) [[ "$role" == client ]] || continue ;;
+            *) die "Unknown endpoint selector '$mode'" ;;
+        esac
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$iface" "$type" "$role" "$parent" "$ip" "$mac"
+    done < <(endpoint_rows)
+}
+
+parse_selectors(){
+    SELECT_MODE=all
+    SELECT_IFACE=''
+    REST=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all) SELECT_MODE=all ;;
+            --pcs) SELECT_MODE=pcs ;;
+            --phones) SELECT_MODE=phones ;;
+            --clients) SELECT_MODE=clients ;;
+            --interface)
+                [[ $# -ge 2 ]] || die "--interface requires a value"
+                SELECT_IFACE="$2"; shift
+                ;;
+            --interface=*) SELECT_IFACE="${1#*=}" ;;
+            *) REST+=("$1") ;;
+        esac
+        shift
+    done
+    if [[ -n "$SELECT_IFACE" ]]; then iface_exists "$SELECT_IFACE"; fi
+}
+
+iperf_bound(){
+    local iface="$1"; shift
+    local ip; ip="$(ipv4_of "$iface")"
+    [[ -n "$ip" ]] || die "No IPv4 address on $iface"
+    if iperf3 --help 2>&1 | grep -q -- '--bind-dev'; then
+        sudo_if_needed iperf3 -B "$ip" --bind-dev "$iface" "$@"
+    else
+        sudo_if_needed iperf3 -B "${ip}%${iface}" "$@"
+    fi
+}
+
+help(){
+cat <<'HELP'
+LabHost v1.5 endpoint-aware commands
+
+Managed endpoint selectors:
+  --all | --pcs | --phones | --clients | --interface <iface>
+
+Clients:
+  clients-list [selectors]
+  clients-status [selectors]
+  clients-arp [selectors]
+  clients-ping <destination> [count] [selectors]
+  clients-traffic <destination> <port> [interval] [selectors]
+  clients-iperf <server> [seconds] [selectors]
+
+iperf:
+  iperf-server [port] [--interface <iface>]
+  iperf-client <server> [seconds] [--interface <iface>]
+  iperf-udp <server> <rate> [seconds] [--interface <iface>]
+  iperf-reverse <server> [seconds] [--interface <iface>]
+  iperf-bidir <server> [seconds] [--interface <iface>]
+  iperf-parallel <server> <streams> [seconds] [--interface <iface>]
+  iperf-bind <source-ip> <server> [seconds] [--interface <iface>]
+  iperf-test <server> [--interface <iface>]
+
+Path/traffic:
+  path-test <destination> [--interface <iface>]
+  send-tcp <destination> <port> [message] [--count N] [--interval SEC] [--source IP] [--interface IF]
+  send-udp <destination> <port> [message] [--interface IF]
+  send-broadcast <interface> <port> [message]
+HELP
+}
+
+case "$CMD" in
+help|-h|--help)
+    help
+    ;;
+clients-list)
+    parse_selectors "$@"
+    printf '%-16s %-10s %-8s %-8s %-15s %-18s\n' ENDPOINT TYPE ROLE PARENT IPv4 MAC
+    selected_rows "$SELECT_MODE" "$SELECT_IFACE" | while IFS=$'\t' read -r iface type role parent ip mac; do
+        printf '%-16s %-10s %-8s %-8s %-15s %-18s\n' "$iface" "$type" "$role" "$parent" "$ip" "$mac"
+    done
+    ;;
+clients-status)
+    parse_selectors "$@"
+    printf '%-16s %-8s %-8s %-15s %-18s %-10s %-12s\n' ENDPOINT ROLE PARENT IPv4 MAC ARP_IGNORE ARP_ANNOUNCE
+    selected_rows "$SELECT_MODE" "$SELECT_IFACE" | while IFS=$'\t' read -r iface _type role parent ip mac; do
+        ai="$(sysctl -n "net.ipv4.conf.${iface}.arp_ignore" 2>/dev/null || echo '-')"
+        aa="$(sysctl -n "net.ipv4.conf.${iface}.arp_announce" 2>/dev/null || echo '-')"
+        printf '%-16s %-8s %-8s %-15s %-18s %-10s %-12s\n' "$iface" "$role" "$parent" "$ip" "$mac" "$ai" "$aa"
+    done
+    ;;
+clients-arp)
+    parse_selectors "$@"; count=0
+    while IFS=$'\t' read -r iface _type role _parent ip _mac; do
+        [[ "$ip" != '-' ]] || continue
+        printf '%-16s %-7s %-15s ' "$iface" "$role" "$ip"
+        if sudo_if_needed arping -A -c 1 -I "$iface" "$ip" >/dev/null 2>&1; then
+            echo 'ARP sent'; count=$((count + 1))
+        else
+            echo 'FAILED'
+        fi
+    done < <(selected_rows "$SELECT_MODE" "$SELECT_IFACE")
+    echo; echo "$count gratuitous ARPs sent."
+    ;;
+clients-ping)
+    parse_selectors "$@"; [[ ${#REST[@]} -ge 1 ]] || { help; exit 2; }
+    dst="${REST[0]}"; ping_count="${REST[1]:-1}"
+    while IFS=$'\t' read -r iface _type role _parent ip _mac; do
+        [[ "$ip" != '-' ]] || continue
+        printf '%-16s %-7s %-15s -> %-15s ' "$iface" "$role" "$ip" "$dst"
+        if ping -I "$iface" -c "$ping_count" -W 1 "$dst" >/dev/null 2>&1; then echo OK; else echo 'NO REPLY'; fi
+    done < <(selected_rows "$SELECT_MODE" "$SELECT_IFACE")
+    ;;
+clients-traffic)
+    parse_selectors "$@"; [[ ${#REST[@]} -ge 2 ]] || { help; exit 2; }
+    dst="${REST[0]}"; port="${REST[1]}"; interval="${REST[2]:-1}"
+    while true; do
+        while IFS=$'\t' read -r iface _type role _parent ip _mac; do
+            [[ "$ip" != '-' ]] || continue
+            msg="client=$iface role=$role ip=$ip time=$(date -Is)"
+            printf '%s\n' "$msg" | sudo_if_needed socat - "TCP:$dst:$port,bind=$ip,so-bindtodevice=$iface" >/dev/null 2>&1 || true
+        done < <(selected_rows "$SELECT_MODE" "$SELECT_IFACE")
+        sleep "$interval"
+    done
+    ;;
+clients-iperf)
+    parse_selectors "$@"; [[ ${#REST[@]} -ge 1 ]] || { help; exit 2; }
+    server="${REST[0]}"; seconds="${REST[1]:-10}"
+    found=0; failed=0
+    while IFS=$'\t' read -r iface _type role _parent ip _mac; do
+        [[ "$ip" != '-' ]] || continue
+        found=1
+        echo; echo "=== $iface ($role, $ip) -> $server ==="
+        if ! iperf_bound "$iface" -c "$server" -t "$seconds"; then failed=$((failed + 1)); fi
+    done < <(selected_rows "$SELECT_MODE" "$SELECT_IFACE")
+    (( found )) || die "No selected managed endpoints with IPv4 addresses."
+    (( failed == 0 )) || exit 1
+    ;;
+iperf-server)
+    parse_selectors "$@"; port="${REST[0]:-5201}"
+    if [[ -n "$SELECT_IFACE" ]]; then iperf_bound "$SELECT_IFACE" -s -p "$port"; else exec iperf3 -s -p "$port"; fi
+    ;;
+iperf-client)
+    parse_selectors "$@"; [[ ${#REST[@]} -ge 1 ]] || { help; exit 2; }
+    if [[ -n "$SELECT_IFACE" ]]; then iperf_bound "$SELECT_IFACE" -c "${REST[0]}" -t "${REST[1]:-10}"; else exec iperf3 -c "${REST[0]}" -t "${REST[1]:-10}"; fi
+    ;;
+iperf-udp)
+    parse_selectors "$@"; [[ ${#REST[@]} -ge 2 ]] || { help; exit 2; }
+    if [[ -n "$SELECT_IFACE" ]]; then iperf_bound "$SELECT_IFACE" -c "${REST[0]}" -u -b "${REST[1]}" -t "${REST[2]:-10}"; else exec iperf3 -c "${REST[0]}" -u -b "${REST[1]}" -t "${REST[2]:-10}"; fi
+    ;;
+iperf-reverse)
+    parse_selectors "$@"; [[ ${#REST[@]} -ge 1 ]] || { help; exit 2; }
+    if [[ -n "$SELECT_IFACE" ]]; then iperf_bound "$SELECT_IFACE" -c "${REST[0]}" -R -t "${REST[1]:-10}"; else exec iperf3 -c "${REST[0]}" -R -t "${REST[1]:-10}"; fi
+    ;;
+iperf-bidir)
+    parse_selectors "$@"; [[ ${#REST[@]} -ge 1 ]] || { help; exit 2; }
+    if [[ -n "$SELECT_IFACE" ]]; then iperf_bound "$SELECT_IFACE" -c "${REST[0]}" --bidir -t "${REST[1]:-10}"; else exec iperf3 -c "${REST[0]}" --bidir -t "${REST[1]:-10}"; fi
+    ;;
+iperf-parallel)
+    parse_selectors "$@"; [[ ${#REST[@]} -ge 2 ]] || { help; exit 2; }
+    if [[ -n "$SELECT_IFACE" ]]; then iperf_bound "$SELECT_IFACE" -c "${REST[0]}" -P "${REST[1]}" -t "${REST[2]:-10}"; else exec iperf3 -c "${REST[0]}" -P "${REST[1]}" -t "${REST[2]:-10}"; fi
+    ;;
+iperf-bind)
+    parse_selectors "$@"; [[ ${#REST[@]} -ge 2 ]] || { help; exit 2; }
+    src="${REST[0]}"; server="${REST[1]}"; seconds="${REST[2]:-10}"
+    if [[ -z "$SELECT_IFACE" ]]; then
+        SELECT_IFACE="$(ip -4 -o addr show | awk -v ip="$src" '$4 ~ ("^" ip "/") {print $2; exit}')"
+    fi
+    if [[ -n "$SELECT_IFACE" ]]; then
+        iface_exists "$SELECT_IFACE"
+        if iperf3 --help 2>&1 | grep -q -- '--bind-dev'; then
+            sudo_if_needed iperf3 -B "$src" --bind-dev "$SELECT_IFACE" -c "$server" -t "$seconds"
+        else
+            sudo_if_needed iperf3 -B "${src}%${SELECT_IFACE}" -c "$server" -t "$seconds"
+        fi
+    else
+        exec iperf3 -B "$src" -c "$server" -t "$seconds"
+    fi
+    ;;
+iperf-test)
+    parse_selectors "$@"; [[ ${#REST[@]} -ge 1 ]] || { help; exit 2; }; server="${REST[0]}"
+    run_test(){ if [[ -n "$SELECT_IFACE" ]]; then iperf_bound "$SELECT_IFACE" "$@"; else iperf3 "$@"; fi; }
+    echo '=== TCP forward ==='; run_test -c "$server" -t 5
+    echo '=== TCP reverse ==='; run_test -c "$server" -R -t 5
+    echo '=== TCP 4 streams ==='; run_test -c "$server" -P 4 -t 5
+    echo '=== UDP 100M ==='; run_test -c "$server" -u -b 100M -t 5
+    ;;
+path-test)
+    parse_selectors "$@"; [[ ${#REST[@]} -ge 1 ]] || { help; exit 2; }; dst="${REST[0]}"
+    if [[ -n "$SELECT_IFACE" ]]; then
+        src="$(ipv4_of "$SELECT_IFACE")"; [[ -n "$src" ]] || die "No IPv4 address on $SELECT_IFACE"
+        echo '=== Route ==='; ip route get "$dst" from "$src" oif "$SELECT_IFACE" 2>/dev/null || true
+        echo; echo '=== Ping ==='; ping -I "$SELECT_IFACE" -c 5 "$dst" || true
+        echo; echo '=== Traceroute ==='; traceroute -n -i "$SELECT_IFACE" "$dst" || true
+        echo; echo '=== MTR ==='; mtr -r -c 5 -a "$src" "$dst" || true
+        echo; echo '=== Neighbors ==='; ip neigh show dev "$SELECT_IFACE" || true
+    else
+        echo '=== Route ==='; ip route get "$dst" 2>/dev/null || ip -6 route get "$dst" 2>/dev/null || true
+        echo; echo '=== Ping ==='; ping -c 5 "$dst" || ping -6 -c 5 "$dst" || true
+        echo; echo '=== Traceroute ==='; traceroute -n "$dst" || true
+        echo; echo '=== MTR ==='; mtr -r -c 5 "$dst" || true
+        echo; echo '=== Neighbors ==='; ip neigh
+    fi
+    ;;
+send-tcp)
+    [[ $# -ge 2 ]] || { help; exit 2; }; dest="$1"; port="$2"; shift 2
+    msg='labhost-test'; count=1; interval=1; source_ip=''; iface=''
+    if [[ $# -gt 0 && "$1" != --* ]]; then msg="$1"; shift; fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --count) count="$2"; shift 2 ;;
+            --interval) interval="$2"; shift 2 ;;
+            --source) source_ip="$2"; shift 2 ;;
+            --interface) iface="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
+    if [[ -n "$iface" ]]; then
+        iface_exists "$iface"
+        [[ -n "$source_ip" ]] || source_ip="$(ipv4_of "$iface")"
+        [[ -n "$source_ip" ]] || die "No IPv4 address on $iface"
+    fi
+    for ((n=1;n<=count;n++)); do
+        if [[ -n "$iface" ]]; then
+            printf '%s\n' "$msg" | sudo_if_needed socat - "TCP:$dest:$port,bind=$source_ip,so-bindtodevice=$iface"
+        elif [[ -n "$source_ip" ]]; then
+            printf '%s\n' "$msg" | socat - "TCP:$dest:$port,bind=$source_ip"
+        else
+            printf '%s\n' "$msg" | nc -w3 "$dest" "$port"
+        fi
+        (( n < count )) && sleep "$interval" || true
+    done
+    ;;
+send-udp)
+    [[ $# -ge 2 ]] || { help; exit 2; }; dest="$1"; port="$2"; shift 2
+    msg='labhost-test'; iface=''
+    if [[ $# -gt 0 && "$1" != --* ]]; then msg="$1"; shift; fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in --interface) iface="$2"; shift 2 ;; *) die "Unknown option: $1" ;; esac
+    done
+    if [[ -n "$iface" ]]; then
+        iface_exists "$iface"; src="$(ipv4_of "$iface")"; [[ -n "$src" ]] || die "No IPv4 address on $iface"
+        printf '%s\n' "$msg" | sudo_if_needed socat - "UDP-DATAGRAM:$dest:$port,bind=$src,so-bindtodevice=$iface"
+    else
+        printf '%s\n' "$msg" | nc -u -w1 "$dest" "$port"
+    fi
+    ;;
+send-broadcast)
+    [[ $# -ge 2 ]] || { help; exit 2; }; iface="$1"; port="$2"; msg="${3:-labhost-broadcast}"; iface_exists "$iface"
+    src="$(ipv4_of "$iface")"; [[ -n "$src" ]] || die "No IPv4 address on $iface"
+    bcast="$(ip -4 -o addr show dev "$iface" | awk '{print $6}' | head -1)"; [[ -n "$bcast" ]] || die "No broadcast address on $iface"
+    printf '%s\n' "$msg" | sudo_if_needed socat - "UDP-DATAGRAM:$bcast:$port,broadcast,bind=$src,so-bindtodevice=$iface"
+    ;;
+*)
+    die "Unsupported endpoint-aware command '$CMD'"
+    ;;
+esac
