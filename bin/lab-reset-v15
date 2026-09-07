@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+
+CORE=/usr/local/lib/labhost/lab-reset-core
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    exec "$CORE" --help
+fi
+[[ $# -eq 0 ]] || { echo 'ERROR: lab-reset takes no arguments.' >&2; exit 2; }
+
+# Stop v1.5 background services and discard unsaved service intent before the
+# existing reset removes derived dataplane state. Ignore absence for backward
+# compatibility with images/startup files that never configured services.
+/usr/local/lib/labhost/servicectl services-reset >/dev/null 2>&1 || true
+
+exec "$CORE"
