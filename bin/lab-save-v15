@@ -41,7 +41,7 @@ fi
 if compgen -G "$SERVICE_INTENT_DIR/*.conf" >/dev/null; then
     tmp="$(mktemp)"
     emit_services >"$tmp"
-    sudo tee -a "$STARTUP" <"$tmp" >/dev/null
+    sudo dd if="$tmp" of="$STARTUP" oflag=append conv=notrunc status=none
     rm -f "$tmp"
     sudo chown root:root "$STARTUP"
     sudo chmod 0755 "$STARTUP"
