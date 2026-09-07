@@ -42,9 +42,11 @@ COPY --from=mcjoin-builder /usr/local/ /usr/local/
 COPY bin/labctl /usr/local/lib/labhost/labctl
 COPY bin/endpointctl /usr/local/lib/labhost/endpointctl
 COPY bin/servicectl /usr/local/lib/labhost/servicectl
+COPY bin/lab-reset /usr/local/lib/labhost/lab-reset-core
 COPY bin/labctl-wrapper /usr/local/bin/labctl
 COPY bin/lab-help /usr/local/bin/lab-help
-COPY bin/lab-reset /usr/local/bin/lab-reset
+COPY bin/lab-save-v15 /usr/local/bin/lab-save
+COPY bin/lab-reset-v15 /usr/local/bin/lab-reset
 COPY bin/dhcp-leases /usr/local/bin/dhcp-leases
 COPY bin/pc-phone-create /usr/local/bin/pc-phone-create
 COPY lib/pc_phone_lldp.py /usr/local/lib/labhost/pc_phone_lldp.py
@@ -54,11 +56,12 @@ COPY motd /etc/motd
 
 RUN chmod 0755 \
         /usr/local/lib/labhost/labctl /usr/local/lib/labhost/endpointctl /usr/local/lib/labhost/servicectl \
-        /usr/local/bin/labctl /usr/local/bin/lab-help /usr/local/bin/lab-reset \
+        /usr/local/lib/labhost/lab-reset-core \
+        /usr/local/bin/labctl /usr/local/bin/lab-help /usr/local/bin/lab-save /usr/local/bin/lab-reset \
         /usr/local/bin/dhcp-leases /usr/local/bin/pc-phone-create \
         /usr/local/bin/labhost-entrypoint /usr/local/lib/labhost/pc_phone_lldp.py \
     && for cmd in \
-        lab-status lab-save lab-config lab-readme mgmt-vrf-status \
+        lab-status lab-config lab-readme mgmt-vrf-status \
         vrf-create vrf-delete vrf-add vrf-remove vrf-status vrf-route-add vrf-route-del vrf-exec \
         lag-create lag-delete lag-status lag-member-up lag-member-down \
         vlan-create vlan-delete vlan-list qinq-create qinq-delete \
@@ -86,7 +89,8 @@ RUN chmod 0755 \
         syslog-server-start syslog-server-stop syslog-server-status syslog-tail syslog-clear syslog-send \
         snmp-server-start snmp-server-stop snmp-server-status \
         snmp-trap-listen snmp-trap-stop snmp-trap-status snmp-trap-tail \
-        radius-client-add radius-user-add radius-user-delete radius-server-start radius-server-stop radius-server-status radius-log; \
+        radius-client-add radius-user-add radius-user-delete radius-server-start radius-server-stop radius-server-status radius-log \
+        services-status services-reset; \
       do ln -s /usr/local/lib/labhost/servicectl "/usr/local/bin/$cmd"; done
 
 RUN useradd -m -s /bin/bash lab \
