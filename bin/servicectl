@@ -1,0 +1,222 @@
+#!/bin/bash
+set -euo pipefail
+
+CMD="$(basename "$0")"
+if [[ "$CMD" == "servicectl" ]]; then CMD="${1:-help}"; shift || true; fi
+STATE=/run/labhost/services
+mkdir -p "$STATE" 2>/dev/null || true
+
+sudo_if_needed(){ if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+ipv4_of(){ ip -4 -o addr show dev "$1" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1; }
+resolve_bind(){
+    local v="${1:-}"
+    [[ -n "$v" ]] || { echo 0.0.0.0; return; }
+    if ip link show "$v" >/dev/null 2>&1; then
+        local ip; ip="$(ipv4_of "$v")"; [[ -n "$ip" ]] || die "No IPv4 address on $v"; echo "$ip"
+    elif [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$v"
+    else die "Bind target '$v' is not an interface or IPv4 address"
+    fi
+}
+parse_bind(){
+    BIND=''; REST=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --bind|--interface) [[ $# -ge 2 ]] || die "$1 requires a value"; BIND="$2"; shift ;;
+            --bind=*|--interface=*) BIND="${1#*=}" ;;
+            *) REST+=("$1") ;;
+        esac
+        shift
+    done
+}
+pid_running(){
+    local p="$1" pid
+    [[ -r "$p" ]] || return 1
+    pid="$(cat "$p" 2>/dev/null || true)"; [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    ps -p "$pid" >/dev/null 2>&1
+}
+stop_pid(){
+    local p="$1"
+    if pid_running "$p"; then sudo_if_needed kill "$(cat "$p")" 2>/dev/null || true; fi
+    sudo_if_needed rm -f "$p" 2>/dev/null || true
+}
+start_bg(){
+    local pidfile="$1" logfile="$2"; shift 2
+    stop_pid "$pidfile"
+    sudo_if_needed bash -c 'pidfile="$1"; logfile="$2"; shift 2; nohup "$@" >>"$logfile" 2>&1 & echo $! >"$pidfile"' _ "$pidfile" "$logfile" "$@"
+    sleep 0.3
+    pid_running "$pidfile" || { tail -20 "$logfile" 2>/dev/null || true; die "Service did not remain running"; }
+}
+status_pid(){
+    local name="$1" p="$2" log="$3"
+    if pid_running "$p"; then echo "$name: running (pid $(cat "$p"))"; [[ -f "$log" ]] && echo "log: $log"; else echo "$name: stopped"; return 1; fi
+}
+help(){ cat <<'EOF'
+LabHost lightweight network services
+
+NTP:
+  ntp-server-start [--bind <interface|ip>]
+  ntp-server-stop | ntp-server-status
+  ntp-query <server>
+
+Syslog:
+  syslog-server-start [--bind <interface|ip>] [--udp|--tcp|--both] [--port N]
+  syslog-server-stop | syslog-server-status | syslog-tail | syslog-clear
+  syslog-send <server> <message> [--tcp] [--port N]
+
+SNMP:
+  snmp-server-start [--bind <interface|ip>] [--community STRING]
+  snmp-server-stop | snmp-server-status
+  snmp-trap-listen [--bind <interface|ip>] [--port N]
+  snmp-trap-stop | snmp-trap-status | snmp-trap-tail
+
+RADIUS:
+  radius-client-add <name> <ip-or-network> <secret>
+  radius-user-add <username> <password>
+  radius-user-delete <username>
+  radius-server-start [--bind <interface|ip>]
+  radius-server-stop | radius-server-status | radius-log
+EOF
+}
+
+case "$CMD" in
+help|-h|--help) help ;;
+ntp-server-start)
+    parse_bind "$@"; [[ ${#REST[@]} -eq 0 ]] || die "Unexpected argument: ${REST[0]}"
+    command -v chronyd >/dev/null || die "chronyd is not installed"
+    ip="$(resolve_bind "$BIND")"; conf="$STATE/chrony.conf"; pid="$STATE/chrony.pid"; log="$STATE/chrony.log"
+    {
+        echo 'driftfile /run/labhost/services/chrony.drift'
+        echo 'local stratum 10'
+        echo 'allow 0.0.0.0/0'
+        echo 'logdir /run/labhost/services'
+        [[ "$ip" != 0.0.0.0 ]] && echo "bindaddress $ip"
+    } >"$conf"
+    start_bg "$pid" "$log" chronyd -d -x -f "$conf"
+    echo "NTP server listening on ${ip}:123 (container clock is never adjusted)."
+    ;;
+ntp-server-stop) stop_pid "$STATE/chrony.pid"; echo 'NTP server stopped.' ;;
+ntp-server-status) status_pid 'NTP server' "$STATE/chrony.pid" "$STATE/chrony.log" ;;
+ntp-query)
+    [[ $# -eq 1 ]] || { echo 'Usage: ntp-query <server>'; exit 2; }
+    if command -v chronyd >/dev/null && command -v chronyc >/dev/null; then chronyd -Q -t 3 "server $1 iburst" 2>&1 | tail -5; else die 'chrony is not installed'; fi
+    ;;
+syslog-server-start)
+    parse_bind "$@"; mode=both; port=514; i=0
+    while (( i < ${#REST[@]} )); do
+        case "${REST[$i]}" in
+            --udp) mode=udp ;;
+            --tcp) mode=tcp ;;
+            --both) mode=both ;;
+            --port) i=$((i+1)); (( i < ${#REST[@]} )) || die '--port requires a value'; port="${REST[$i]}" ;;
+            *) die "Unknown option: ${REST[$i]}" ;;
+        esac; i=$((i+1))
+    done
+    ip="$(resolve_bind "$BIND")"; py="$STATE/syslog_server.py"; pid="$STATE/syslog.pid"; log="$STATE/syslog.log"
+    cat >"$py" <<'PY'
+import argparse,datetime,select,socket
+ap=argparse.ArgumentParser(); ap.add_argument('--bind'); ap.add_argument('--port',type=int); ap.add_argument('--mode'); a=ap.parse_args()
+socks=[]
+def stamp(addr,proto,msg):
+    t=datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat(timespec='seconds')
+    text=msg.decode('utf-8','replace').rstrip('\r\n')
+    print(f'{t} {proto} {addr[0]}:{addr[1]} {text}',flush=True)
+if a.mode in ('udp','both'):
+    u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); u.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); u.bind((a.bind,a.port)); socks.append(u)
+if a.mode in ('tcp','both'):
+    t=socket.socket(socket.AF_INET,socket.SOCK_STREAM); t.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); t.bind((a.bind,a.port)); t.listen(16); socks.append(t)
+while True:
+    ready,_,_=select.select(socks,[],[])
+    for s in ready:
+        if s.type == socket.SOCK_DGRAM:
+            data,addr=s.recvfrom(65535); stamp(addr,'UDP',data)
+        else:
+            c,addr=s.accept(); data=c.recv(65535); c.close(); stamp(addr,'TCP',data)
+PY
+    : >"$log"; start_bg "$pid" "$log" python3 "$py" --bind "$ip" --port "$port" --mode "$mode"
+    echo "Syslog server listening on $ip:$port ($mode)."
+    ;;
+syslog-server-stop) stop_pid "$STATE/syslog.pid"; echo 'Syslog server stopped.' ;;
+syslog-server-status) status_pid 'Syslog server' "$STATE/syslog.pid" "$STATE/syslog.log" ;;
+syslog-tail) touch "$STATE/syslog.log"; tail -f "$STATE/syslog.log" ;;
+syslog-clear) : >"$STATE/syslog.log"; echo 'Syslog log cleared.' ;;
+syslog-send)
+    [[ $# -ge 2 ]] || { echo 'Usage: syslog-send <server> <message> [--tcp] [--port N]'; exit 2; }
+    server="$1"; msg="$2"; shift 2; proto=udp; port=514
+    while [[ $# -gt 0 ]]; do case "$1" in --tcp) proto=tcp; shift ;; --port) port="$2"; shift 2 ;; *) die "Unknown option: $1" ;; esac; done
+    if [[ "$proto" == tcp ]]; then printf '%s\n' "$msg" | nc -w3 "$server" "$port"; else printf '%s\n' "$msg" | nc -u -w1 "$server" "$port"; fi
+    ;;
+snmp-server-start)
+    parse_bind "$@"; community=public; i=0
+    while (( i < ${#REST[@]} )); do case "${REST[$i]}" in --community) i=$((i+1)); community="${REST[$i]}" ;; *) die "Unknown option: ${REST[$i]}" ;; esac; i=$((i+1)); done
+    command -v snmpd >/dev/null || die 'snmpd is not installed'
+    ip="$(resolve_bind "$BIND")"; conf="$STATE/snmpd.conf"; pid="$STATE/snmpd.pid"; log="$STATE/snmpd.log"
+    addr='udp:161'; [[ "$ip" != 0.0.0.0 ]] && addr="udp:$ip:161"
+    cat >"$conf" <<EOF
+agentaddress $addr
+rocommunity $community
+sysLocation LabHost
+sysContact labhost
+sysName $(hostname -s)
+EOF
+    : >"$log"; start_bg "$pid" "$log" snmpd -f -Lo -C -c "$conf"
+    echo "SNMP agent listening on $addr (community '$community')."
+    ;;
+snmp-server-stop) stop_pid "$STATE/snmpd.pid"; echo 'SNMP agent stopped.' ;;
+snmp-server-status) status_pid 'SNMP agent' "$STATE/snmpd.pid" "$STATE/snmpd.log" ;;
+snmp-trap-listen)
+    parse_bind "$@"; port=162; [[ ${#REST[@]} -le 2 ]] || die 'Too many arguments'
+    if [[ ${#REST[@]} -gt 0 ]]; then [[ "${REST[0]}" == --port && ${#REST[@]} -eq 2 ]] || die 'Usage: snmp-trap-listen [--bind IF|IP] [--port N]'; port="${REST[1]}"; fi
+    command -v snmptrapd >/dev/null || die 'snmptrapd is not installed'
+    ip="$(resolve_bind "$BIND")"; conf="$STATE/snmptrapd.conf"; pid="$STATE/snmptrapd.pid"; log="$STATE/snmptrapd.log"
+    echo 'disableAuthorization yes' >"$conf"; : >"$log"
+    addr="udp:$ip:$port"; [[ "$ip" == 0.0.0.0 ]] && addr="udp:$port"
+    start_bg "$pid" "$log" snmptrapd -f -Lo -C -c "$conf" "$addr"
+    echo "SNMP trap receiver listening on $addr."
+    ;;
+snmp-trap-stop) stop_pid "$STATE/snmptrapd.pid"; echo 'SNMP trap receiver stopped.' ;;
+snmp-trap-status) status_pid 'SNMP trap receiver' "$STATE/snmptrapd.pid" "$STATE/snmptrapd.log" ;;
+snmp-trap-tail) touch "$STATE/snmptrapd.log"; tail -f "$STATE/snmptrapd.log" ;;
+radius-client-add)
+    [[ $# -eq 3 ]] || { echo 'Usage: radius-client-add <name> <ip-or-network> <secret>'; exit 2; }
+    mkdir -p "$STATE/radius-clients"; cat >"$STATE/radius-clients/$1.conf" <<EOF
+client $1 {
+    ipaddr = $2
+    secret = $3
+}
+EOF
+    echo "RADIUS client '$1' saved."
+    ;;
+radius-user-add)
+    [[ $# -eq 2 ]] || { echo 'Usage: radius-user-add <username> <password>'; exit 2; }
+    mkdir -p "$STATE/radius-users"; printf '%s Cleartext-Password := "%s"\n' "$1" "$2" >"$STATE/radius-users/$1"
+    echo "RADIUS user '$1' saved."
+    ;;
+radius-user-delete) [[ $# -eq 1 ]] || exit 2; rm -f "$STATE/radius-users/$1"; echo "RADIUS user '$1' removed." ;;
+radius-server-start)
+    parse_bind "$@"; [[ ${#REST[@]} -eq 0 ]] || die "Unexpected argument: ${REST[0]}"
+    command -v freeradius >/dev/null || die 'freeradius server is not installed'
+    ip="$(resolve_bind "$BIND")"; root="$STATE/radius"; pid="$STATE/radius.pid"; log="$STATE/radius.log"
+    rm -rf "$root"; cp -a /etc/freeradius/3.0 "$root"
+    mkdir -p "$STATE/radius-clients" "$STATE/radius-users"
+    cat "$STATE"/radius-clients/*.conf 2>/dev/null >>"$root/clients.conf" || true
+    cat "$STATE"/radius-users/* 2>/dev/null >>"$root/mods-config/files/authorize" || true
+    if [[ "$ip" != 0.0.0.0 ]]; then
+        # Restrict the default auth listener without rewriting the packaged config tree.
+        cat >>"$root/sites-enabled/default" <<EOF
+listen {
+    type = auth
+    ipaddr = $ip
+    port = 18120
+}
+EOF
+        echo "NOTE: custom bind uses auxiliary auth port 18120; default packaged listeners may also remain active."
+    fi
+    : >"$log"; start_bg "$pid" "$log" freeradius -f -l stdout -d "$root"
+    echo 'RADIUS server started.'
+    ;;
+radius-server-stop) stop_pid "$STATE/radius.pid"; echo 'RADIUS server stopped.' ;;
+radius-server-status) status_pid 'RADIUS server' "$STATE/radius.pid" "$STATE/radius.log" ;;
+radius-log) touch "$STATE/radius.log"; tail -f "$STATE/radius.log" ;;
+*) die "Unsupported service command '$CMD'" ;;
+esac
