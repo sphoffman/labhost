@@ -23,7 +23,7 @@ FROM debian:13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENV LABHOST_VERSION="1.4"
+ENV LABHOST_VERSION="1.5-dev1"
 
 RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' | debconf-set-selections \
     && echo 'iperf3 iperf3/start_daemon boolean false' | debconf-set-selections \
@@ -32,14 +32,16 @@ RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' | debc
         bash ca-certificates curl wget git openssh-server sudo iproute2 ifenslave \
         iputils-ping iputils-arping traceroute mtr-tiny ethtool net-tools bridge-utils vlan \
         tcpdump tshark tcpreplay netsniff-ng iperf iperf3 hping3 nmap fping socat netcat-openbsd \
-        dnsutils ldnsutils dnsmasq dhcpcd-base nftables iptables ebtables conntrack lldpd snmp snmpd \
-        freeradius-utils ndisc6 bmon iftop iptraf-ng tftp-hpa telnet ftp openssl rsync jq vim-tiny \
+        dnsutils ldnsutils dnsmasq dhcpcd-base nftables iptables ebtables conntrack lldpd snmp snmpd snmptrapd \
+        freeradius freeradius-utils chrony ndisc6 bmon iftop iptraf-ng tftp-hpa telnet ftp openssl rsync jq vim-tiny \
         nano less procps psmisc lsof strace file tree whois ipcalc python3 python3-pip python3-scapy \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=mcjoin-builder /usr/local/ /usr/local/
 
 COPY bin/labctl /usr/local/lib/labhost/labctl
+COPY bin/endpointctl /usr/local/lib/labhost/endpointctl
+COPY bin/servicectl /usr/local/lib/labhost/servicectl
 COPY bin/labctl-wrapper /usr/local/bin/labctl
 COPY bin/lab-help /usr/local/bin/lab-help
 COPY bin/lab-reset /usr/local/bin/lab-reset
@@ -51,8 +53,9 @@ COPY README.md /usr/local/share/labhost/README.md
 COPY motd /etc/motd
 
 RUN chmod 0755 \
-        /usr/local/lib/labhost/labctl /usr/local/bin/labctl /usr/local/bin/lab-help \
-        /usr/local/bin/lab-reset /usr/local/bin/dhcp-leases /usr/local/bin/pc-phone-create \
+        /usr/local/lib/labhost/labctl /usr/local/lib/labhost/endpointctl /usr/local/lib/labhost/servicectl \
+        /usr/local/bin/labctl /usr/local/bin/lab-help /usr/local/bin/lab-reset \
+        /usr/local/bin/dhcp-leases /usr/local/bin/pc-phone-create \
         /usr/local/bin/labhost-entrypoint /usr/local/lib/labhost/pc_phone_lldp.py \
     && for cmd in \
         lab-status lab-save lab-config lab-readme mgmt-vrf-status \
@@ -72,7 +75,19 @@ RUN chmod 0755 \
         pc-phones-create pc-phones-status radius-test snmp-walk snmp-get arp-watch nd-watch gratuitous-arp \
         arp-clear clients-create clients-delete clients-list clients-status clients-arp clients-ping \
         clients-traffic endpoint-move send-tcp send-udp send-broadcast send-mcast; \
-      do ln -s /usr/local/bin/labctl "/usr/local/bin/$cmd"; done
+      do ln -s /usr/local/bin/labctl "/usr/local/bin/$cmd"; done \
+    && for cmd in \
+        clients-list clients-status clients-arp clients-ping clients-traffic clients-iperf \
+        iperf-server iperf-client iperf-udp iperf-reverse iperf-bidir iperf-parallel iperf-bind iperf-test \
+        path-test send-tcp send-udp send-broadcast; \
+      do ln -sf /usr/local/lib/labhost/endpointctl "/usr/local/bin/$cmd"; done \
+    && for cmd in \
+        ntp-server-start ntp-server-stop ntp-server-status ntp-query \
+        syslog-server-start syslog-server-stop syslog-server-status syslog-tail syslog-clear syslog-send \
+        snmp-server-start snmp-server-stop snmp-server-status \
+        snmp-trap-listen snmp-trap-stop snmp-trap-status snmp-trap-tail \
+        radius-client-add radius-user-add radius-user-delete radius-server-start radius-server-stop radius-server-status radius-log; \
+      do ln -s /usr/local/lib/labhost/servicectl "/usr/local/bin/$cmd"; done
 
 RUN useradd -m -s /bin/bash lab \
     && echo 'lab ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/lab \
@@ -96,5 +111,9 @@ RUN printf '%s\n' \
         > /etc/profile.d/labhost-env.sh \
     && chmod 0644 /etc/profile.d/labhost-env.sh
 
-EXPOSE 22/tcp 5001/tcp 5001/udp 5201/tcp 5201/udp 8000/tcp 8080/tcp 8443/tcp
+EXPOSE 22/tcp \
+       53/tcp 53/udp 67/udp 68/udp \
+       123/udp 161/udp 162/udp 514/tcp 514/udp \
+       1812/udp 1813/udp \
+       5001/tcp 5001/udp 5201/tcp 5201/udp 8000/tcp 8080/tcp 8443/tcp
 ENTRYPOINT ["/usr/local/bin/labhost-entrypoint"]
