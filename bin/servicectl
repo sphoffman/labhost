@@ -86,7 +86,9 @@ stop_pid(){
             ps -p "$pid" >/dev/null 2>&1 || break
             sleep 0.1
         done
-        ps -p "$pid" >/dev/null 2>&1 && sudo_if_needed kill -KILL "$pid" 2>/dev/null || true
+        if ps -p "$pid" >/dev/null 2>&1; then
+            sudo_if_needed kill -KILL "$pid" 2>/dev/null || true
+        fi
     fi
     sudo_if_needed rm -f "$p" 2>/dev/null || true
 }
@@ -211,7 +213,8 @@ syslog-server-start)
         esac
         i=$((i+1))
     done
-    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || die 'Invalid port'
+    [[ "$port" =~ ^[0-9]+$ ]] || die 'Invalid port'
+    (( port >= 1 && port <= 65535 )) || die 'Invalid port'
     ip="$(resolve_bind "$BIND")"
     py="$STATE/syslog_server.py"; pid="$STATE/syslog.pid"; log="$STATE/syslog.log"
     cat >"$py" <<'PY'
