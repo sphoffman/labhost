@@ -22,12 +22,14 @@ jobs:
           bash -n bin/servicectl
           bash -n bin/labctl-wrapper
           bash -n bin/lab-help
+          bash -n bin/lab-save-v15
           bash -n bin/lab-reset
+          bash -n bin/lab-reset-v15
           bash -n bin/pc-phone-create
           bash -n entrypoint.sh
           bash -n smoke-test.sh
       - name: ShellCheck v1.5 helpers
-        run: shellcheck -x bin/endpointctl bin/servicectl
+        run: shellcheck -x bin/endpointctl bin/servicectl bin/lab-save-v15 bin/lab-reset-v15
 
   docker:
     runs-on: ubuntu-latest
@@ -52,7 +54,95 @@ jobs:
             command -v snmp-server-start
             command -v snmp-trap-listen
             command -v radius-server-start
+            command -v services-status
+            command -v services-reset
             command -v chronyd
             command -v snmptrapd
             command -v freeradius
+            test -x /usr/local/bin/lab-save
+            test -x /usr/local/lib/labhost/lab-reset-core
           '
+      - name: Verify endpoint discovery
+        run: |
+          docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW --entrypoint /bin/bash labhost:validate -lc '
+            set -e
+            mkdir -p /run/labhost/pc-phones
+            ip link add eth1 type dummy
+            ip link set eth1 up
+            ip link add link eth1 name cl1 address 02:00:00:00:00:01 type macvlan mode bridge
+            ip addr add 192.0.2.11/24 dev cl1
+            ip link set cl1 up
+            ip link add link eth1 name pp-eth1-pc address 02:00:00:00:00:02 type macvlan mode bridge
+            ip addr add 192.0.2.12/24 dev pp-eth1-pc
+            ip link set pp-eth1-pc up
+            ip link add link eth1 name pp-eth1-v1111 type vlan id 1111
+            ip link set pp-eth1-v1111 address 02:00:00:00:00:03
+            ip addr add 198.51.100.13/24 dev pp-eth1-v1111
+            ip link set pp-eth1-v1111 up
+            printf "vlan=1111\ntagged=1\npriority=0\ndscp=0\nvoice_iface=pp-eth1-v1111\n" > /run/labhost/pc-phones/eth1.state
+            clients-list | tee /tmp/endpoints
+            grep -q "cl1.*synthetic.*client" /tmp/endpoints
+            grep -q "pp-eth1-pc.*pc-phone.*pc" /tmp/endpoints
+            grep -q "pp-eth1-v1111.*pc-phone.*phone" /tmp/endpoints
+            clients-status --pcs | grep -q pp-eth1-pc
+            clients-status --phones | grep -q pp-eth1-v1111
+          '
+      - name: Verify lightweight services and persistence
+        run: |
+          docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW --entrypoint /bin/bash labhost:validate -lc '
+            set -e
+            mkdir -p /run/labhost/intents /config
+            chown -R lab:lab /run/labhost/intents
+
+            syslog-server-start --bind 127.0.0.1 --udp --port 5514
+            syslog-send 127.0.0.1 ci-syslog --port 5514
+            sleep 1
+            grep -q ci-syslog /run/labhost/services/syslog.log
+
+            snmp-server-start --bind 127.0.0.1 --community ci-public
+            snmpget -v2c -c ci-public 127.0.0.1 1.3.6.1.2.1.1.5.0 >/dev/null
+
+            ntp-server-start --bind 127.0.0.1
+            ntp-server-status >/dev/null
+
+            radius-user-add ciuser cipass
+            radius-server-start
+            sleep 1
+            radtest ciuser cipass 127.0.0.1 0 testing123 | tee /tmp/radtest
+            grep -q "Access-Accept" /tmp/radtest
+
+            lab-save --dry-run > /tmp/startup
+            grep -q "syslog-server-start.*5514" /tmp/startup
+            grep -q "snmp-server-start.*ci-public" /tmp/startup
+            grep -q "ntp-server-start" /tmp/startup
+            grep -q "radius-user-add.*ciuser" /tmp/startup
+            grep -q "radius-server-start" /tmp/startup
+
+            services-reset
+            test ! -e /run/labhost/intents/services/syslog-server.conf
+          '
+
+  publish-dev:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/v1.5-dev'
+    needs:
+      - shell
+      - docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish development image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:1.5-dev1
