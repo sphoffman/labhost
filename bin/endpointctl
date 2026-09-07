@@ -32,6 +32,7 @@ endpoint_rows(){
         [[ -r "$f" ]] || continue
         parent="${f##*/}"; parent="${parent%.state}"
         voice_iface=''
+        # shellcheck disable=SC1090
         source "$f"
         [[ -n "${voice_iface:-}" ]] || continue
         ip link show "$voice_iface" >/dev/null 2>&1 || continue
@@ -281,7 +282,9 @@ send-tcp)
         else
             printf '%s\n' "$msg" | nc -w3 "$dest" "$port"
         fi
-        (( n < count )) && sleep "$interval" || true
+        if (( n < count )); then
+            sleep "$interval"
+        fi
     done
     ;;
 send-udp)
