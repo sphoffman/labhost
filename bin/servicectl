@@ -2,57 +2,130 @@
 set -euo pipefail
 
 CMD="$(basename "$0")"
-if [[ "$CMD" == "servicectl" ]]; then CMD="${1:-help}"; shift || true; fi
-STATE=/run/labhost/services
-mkdir -p "$STATE" 2>/dev/null || true
+if [[ "$CMD" == "servicectl" ]]; then
+    CMD="${1:-help}"
+    shift || true
+fi
+
+RUN_ROOT=/run/labhost
+STATE="$RUN_ROOT/services"
+INTENT_ROOT="${LABHOST_INTENT_DIR:-$RUN_ROOT/intents}"
+INTENT_DIR="$INTENT_ROOT/services"
 
 sudo_if_needed(){ if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 ipv4_of(){ ip -4 -o addr show dev "$1" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1; }
+valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_.-]+$ ]] || die "Name '$1' contains unsupported characters."; }
+
+ensure_dirs(){
+    sudo_if_needed mkdir -p "$STATE" "$INTENT_DIR"
+    sudo_if_needed chown lab:lab "$STATE" "$INTENT_DIR" 2>/dev/null || true
+    sudo_if_needed chmod 0700 "$STATE" "$INTENT_DIR" 2>/dev/null || true
+}
+ensure_dirs
+
 resolve_bind(){
     local v="${1:-}"
     [[ -n "$v" ]] || { echo 0.0.0.0; return; }
     if ip link show "$v" >/dev/null 2>&1; then
-        local ip; ip="$(ipv4_of "$v")"; [[ -n "$ip" ]] || die "No IPv4 address on $v"; echo "$ip"
-    elif [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$v"
-    else die "Bind target '$v' is not an interface or IPv4 address"
+        local ip
+        ip="$(ipv4_of "$v")"
+        [[ -n "$ip" ]] || die "No IPv4 address on $v"
+        echo "$ip"
+    elif [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$v"
+    else
+        die "Bind target '$v' is not an interface or IPv4 address"
     fi
 }
+
 parse_bind(){
-    BIND=''; REST=()
+    BIND=''
+    REST=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --bind|--interface) [[ $# -ge 2 ]] || die "$1 requires a value"; BIND="$2"; shift ;;
+            --bind|--interface)
+                [[ $# -ge 2 ]] || die "$1 requires a value"
+                BIND="$2"; shift
+                ;;
             --bind=*|--interface=*) BIND="${1#*=}" ;;
             *) REST+=("$1") ;;
         esac
         shift
     done
 }
+
+write_intent(){
+    local name="$1"; shift
+    local tmp="$INTENT_DIR/.${name}.tmp.$$"
+    {
+        printf '%q' "$1"; shift
+        while [[ $# -gt 0 ]]; do printf ' %q' "$1"; shift; done
+        printf '\n'
+    } >"$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$INTENT_DIR/${name}.conf"
+}
+
+clear_intent(){ rm -f "$INTENT_DIR/$1.conf" 2>/dev/null || true; }
+
 pid_running(){
     local p="$1" pid
     [[ -r "$p" ]] || return 1
-    pid="$(cat "$p" 2>/dev/null || true)"; [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    pid="$(cat "$p" 2>/dev/null || true)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     ps -p "$pid" >/dev/null 2>&1
 }
+
 stop_pid(){
-    local p="$1"
-    if pid_running "$p"; then sudo_if_needed kill "$(cat "$p")" 2>/dev/null || true; fi
+    local p="$1" pid
+    if pid_running "$p"; then
+        pid="$(cat "$p")"
+        sudo_if_needed kill "$pid" 2>/dev/null || true
+        for _ in {1..20}; do
+            ps -p "$pid" >/dev/null 2>&1 || break
+            sleep 0.1
+        done
+        ps -p "$pid" >/dev/null 2>&1 && sudo_if_needed kill -KILL "$pid" 2>/dev/null || true
+    fi
     sudo_if_needed rm -f "$p" 2>/dev/null || true
 }
+
 start_bg(){
     local pidfile="$1" logfile="$2"; shift 2
     stop_pid "$pidfile"
+    sudo_if_needed touch "$logfile"
+    sudo_if_needed chmod 0644 "$logfile"
+    # Expansion is intentionally deferred to the root child shell.
+    # shellcheck disable=SC2016
     sudo_if_needed bash -c 'pidfile="$1"; logfile="$2"; shift 2; nohup "$@" >>"$logfile" 2>&1 & echo $! >"$pidfile"' _ "$pidfile" "$logfile" "$@"
-    sleep 0.3
-    pid_running "$pidfile" || { tail -20 "$logfile" 2>/dev/null || true; die "Service did not remain running"; }
+    sleep 0.4
+    pid_running "$pidfile" || {
+        tail -30 "$logfile" 2>/dev/null || true
+        die "Service did not remain running"
+    }
 }
+
 status_pid(){
     local name="$1" p="$2" log="$3"
-    if pid_running "$p"; then echo "$name: running (pid $(cat "$p"))"; [[ -f "$log" ]] && echo "log: $log"; else echo "$name: stopped"; return 1; fi
+    if pid_running "$p"; then
+        echo "$name: running (pid $(cat "$p"))"
+        [[ -f "$log" ]] && echo "log: $log"
+    else
+        echo "$name: stopped"
+        return 1
+    fi
 }
+
+radius_escape(){
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
 help(){ cat <<'EOF'
-LabHost lightweight network services
+LabHost lightweight network services (v1.5 development)
 
 NTP:
   ntp-server-start [--bind <interface|ip>]
@@ -70,21 +143,34 @@ SNMP:
   snmp-trap-listen [--bind <interface|ip>] [--port N]
   snmp-trap-stop | snmp-trap-status | snmp-trap-tail
 
-RADIUS:
+RADIUS (development):
   radius-client-add <name> <ip-or-network> <secret>
   radius-user-add <username> <password>
   radius-user-delete <username>
-  radius-server-start [--bind <interface|ip>]
+  radius-server-start
   radius-server-stop | radius-server-status | radius-log
+
+General:
+  services-status
+  services-reset
+
+Service starts/configuration are recorded as working intent and are appended by
+lab-save to /config/<hostname>.sh. RADIUS credentials and SNMP communities are
+therefore stored in that startup script if configured.
 EOF
 }
 
 case "$CMD" in
-help|-h|--help) help ;;
+help|-h|--help)
+    help
+    ;;
+
 ntp-server-start)
-    parse_bind "$@"; [[ ${#REST[@]} -eq 0 ]] || die "Unexpected argument: ${REST[0]}"
+    parse_bind "$@"
+    [[ ${#REST[@]} -eq 0 ]] || die "Unexpected argument: ${REST[0]}"
     command -v chronyd >/dev/null || die "chronyd is not installed"
-    ip="$(resolve_bind "$BIND")"; conf="$STATE/chrony.conf"; pid="$STATE/chrony.pid"; log="$STATE/chrony.log"
+    ip="$(resolve_bind "$BIND")"
+    conf="$STATE/chrony.conf"; pid="$STATE/chrony.pid"; log="$STATE/chrony.log"
     {
         echo 'driftfile /run/labhost/services/chrony.drift'
         echo 'local stratum 10'
@@ -92,15 +178,24 @@ ntp-server-start)
         echo 'logdir /run/labhost/services'
         [[ "$ip" != 0.0.0.0 ]] && echo "bindaddress $ip"
     } >"$conf"
+    args=(ntp-server-start)
+    [[ -n "$BIND" ]] && args+=(--bind "$BIND")
     start_bg "$pid" "$log" chronyd -d -x -f "$conf"
+    write_intent ntp-server "${args[@]}"
     echo "NTP server listening on ${ip}:123 (container clock is never adjusted)."
     ;;
-ntp-server-stop) stop_pid "$STATE/chrony.pid"; echo 'NTP server stopped.' ;;
-ntp-server-status) status_pid 'NTP server' "$STATE/chrony.pid" "$STATE/chrony.log" ;;
+ntp-server-stop)
+    stop_pid "$STATE/chrony.pid"; clear_intent ntp-server; echo 'NTP server stopped.'
+    ;;
+ntp-server-status)
+    status_pid 'NTP server' "$STATE/chrony.pid" "$STATE/chrony.log"
+    ;;
 ntp-query)
     [[ $# -eq 1 ]] || { echo 'Usage: ntp-query <server>'; exit 2; }
-    if command -v chronyd >/dev/null && command -v chronyc >/dev/null; then chronyd -Q -t 3 "server $1 iburst" 2>&1 | tail -5; else die 'chrony is not installed'; fi
+    command -v chronyd >/dev/null || die 'chrony is not installed'
+    chronyd -Q -t 3 "server $1 iburst" 2>&1 | tail -8
     ;;
+
 syslog-server-start)
     parse_bind "$@"; mode=both; port=514; i=0
     while (( i < ${#REST[@]} )); do
@@ -108,11 +203,17 @@ syslog-server-start)
             --udp) mode=udp ;;
             --tcp) mode=tcp ;;
             --both) mode=both ;;
-            --port) i=$((i+1)); (( i < ${#REST[@]} )) || die '--port requires a value'; port="${REST[$i]}" ;;
+            --port)
+                i=$((i+1)); (( i < ${#REST[@]} )) || die '--port requires a value'
+                port="${REST[$i]}"
+                ;;
             *) die "Unknown option: ${REST[$i]}" ;;
-        esac; i=$((i+1))
+        esac
+        i=$((i+1))
     done
-    ip="$(resolve_bind "$BIND")"; py="$STATE/syslog_server.py"; pid="$STATE/syslog.pid"; log="$STATE/syslog.log"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || die 'Invalid port'
+    ip="$(resolve_bind "$BIND")"
+    py="$STATE/syslog_server.py"; pid="$STATE/syslog.pid"; log="$STATE/syslog.log"
     cat >"$py" <<'PY'
 import argparse,datetime,select,socket
 ap=argparse.ArgumentParser(); ap.add_argument('--bind'); ap.add_argument('--port',type=int); ap.add_argument('--mode'); a=ap.parse_args()
@@ -124,7 +225,7 @@ def stamp(addr,proto,msg):
 if a.mode in ('udp','both'):
     u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); u.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); u.bind((a.bind,a.port)); socks.append(u)
 if a.mode in ('tcp','both'):
-    t=socket.socket(socket.AF_INET,socket.SOCK_STREAM); t.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); t.bind((a.bind,a.port)); t.listen(16); socks.append(t)
+    t=socket.socket(socket.AF_INET,socket.SOCK_STREAM); t.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); t.bind((a.bind,a.port)); t.listen(32); socks.append(t)
 while True:
     ready,_,_=select.select(socks,[],[])
     for s in ready:
@@ -133,24 +234,55 @@ while True:
         else:
             c,addr=s.accept(); data=c.recv(65535); c.close(); stamp(addr,'TCP',data)
 PY
-    : >"$log"; start_bg "$pid" "$log" python3 "$py" --bind "$ip" --port "$port" --mode "$mode"
+    : >"$log"
+    start_bg "$pid" "$log" python3 "$py" --bind "$ip" --port "$port" --mode "$mode"
+    args=(syslog-server-start)
+    [[ -n "$BIND" ]] && args+=(--bind "$BIND")
+    args+=("--$mode")
+    (( port != 514 )) && args+=(--port "$port")
+    write_intent syslog-server "${args[@]}"
     echo "Syslog server listening on $ip:$port ($mode)."
     ;;
-syslog-server-stop) stop_pid "$STATE/syslog.pid"; echo 'Syslog server stopped.' ;;
-syslog-server-status) status_pid 'Syslog server' "$STATE/syslog.pid" "$STATE/syslog.log" ;;
-syslog-tail) touch "$STATE/syslog.log"; tail -f "$STATE/syslog.log" ;;
-syslog-clear) : >"$STATE/syslog.log"; echo 'Syslog log cleared.' ;;
+syslog-server-stop)
+    stop_pid "$STATE/syslog.pid"; clear_intent syslog-server; echo 'Syslog server stopped.'
+    ;;
+syslog-server-status)
+    status_pid 'Syslog server' "$STATE/syslog.pid" "$STATE/syslog.log"
+    ;;
+syslog-tail)
+    sudo_if_needed touch "$STATE/syslog.log"; tail -f "$STATE/syslog.log"
+    ;;
+syslog-clear)
+    sudo_if_needed truncate -s 0 "$STATE/syslog.log"; echo 'Syslog log cleared.'
+    ;;
 syslog-send)
     [[ $# -ge 2 ]] || { echo 'Usage: syslog-send <server> <message> [--tcp] [--port N]'; exit 2; }
     server="$1"; msg="$2"; shift 2; proto=udp; port=514
-    while [[ $# -gt 0 ]]; do case "$1" in --tcp) proto=tcp; shift ;; --port) port="$2"; shift 2 ;; *) die "Unknown option: $1" ;; esac; done
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tcp) proto=tcp; shift ;;
+            --port) [[ $# -ge 2 ]] || die '--port requires a value'; port="$2"; shift 2 ;;
+            *) die "Unknown option: $1" ;;
+        esac
+    done
     if [[ "$proto" == tcp ]]; then printf '%s\n' "$msg" | nc -w3 "$server" "$port"; else printf '%s\n' "$msg" | nc -u -w1 "$server" "$port"; fi
     ;;
+
 snmp-server-start)
     parse_bind "$@"; community=public; i=0
-    while (( i < ${#REST[@]} )); do case "${REST[$i]}" in --community) i=$((i+1)); community="${REST[$i]}" ;; *) die "Unknown option: ${REST[$i]}" ;; esac; i=$((i+1)); done
+    while (( i < ${#REST[@]} )); do
+        case "${REST[$i]}" in
+            --community)
+                i=$((i+1)); (( i < ${#REST[@]} )) || die '--community requires a value'
+                community="${REST[$i]}"
+                ;;
+            *) die "Unknown option: ${REST[$i]}" ;;
+        esac
+        i=$((i+1))
+    done
     command -v snmpd >/dev/null || die 'snmpd is not installed'
-    ip="$(resolve_bind "$BIND")"; conf="$STATE/snmpd.conf"; pid="$STATE/snmpd.pid"; log="$STATE/snmpd.log"
+    ip="$(resolve_bind "$BIND")"
+    conf="$STATE/snmpd.conf"; pid="$STATE/snmpd.pid"; log="$STATE/snmpd.log"
     addr='udp:161'; [[ "$ip" != 0.0.0.0 ]] && addr="udp:$ip:161"
     cat >"$conf" <<EOF
 agentaddress $addr
@@ -159,64 +291,129 @@ sysLocation LabHost
 sysContact labhost
 sysName $(hostname -s)
 EOF
-    : >"$log"; start_bg "$pid" "$log" snmpd -f -Lo -C -c "$conf"
-    echo "SNMP agent listening on $addr (community '$community')."
+    : >"$log"
+    start_bg "$pid" "$log" snmpd -f -Lo -C -c "$conf"
+    args=(snmp-server-start)
+    [[ -n "$BIND" ]] && args+=(--bind "$BIND")
+    args+=(--community "$community")
+    write_intent snmp-server "${args[@]}"
+    echo "SNMP agent listening on $addr."
     ;;
-snmp-server-stop) stop_pid "$STATE/snmpd.pid"; echo 'SNMP agent stopped.' ;;
-snmp-server-status) status_pid 'SNMP agent' "$STATE/snmpd.pid" "$STATE/snmpd.log" ;;
+snmp-server-stop)
+    stop_pid "$STATE/snmpd.pid"; clear_intent snmp-server; echo 'SNMP agent stopped.'
+    ;;
+snmp-server-status)
+    status_pid 'SNMP agent' "$STATE/snmpd.pid" "$STATE/snmpd.log"
+    ;;
+
 snmp-trap-listen)
-    parse_bind "$@"; port=162; [[ ${#REST[@]} -le 2 ]] || die 'Too many arguments'
-    if [[ ${#REST[@]} -gt 0 ]]; then [[ "${REST[0]}" == --port && ${#REST[@]} -eq 2 ]] || die 'Usage: snmp-trap-listen [--bind IF|IP] [--port N]'; port="${REST[1]}"; fi
+    parse_bind "$@"; port=162; i=0
+    while (( i < ${#REST[@]} )); do
+        case "${REST[$i]}" in
+            --port)
+                i=$((i+1)); (( i < ${#REST[@]} )) || die '--port requires a value'
+                port="${REST[$i]}"
+                ;;
+            *) die "Unknown option: ${REST[$i]}" ;;
+        esac
+        i=$((i+1))
+    done
     command -v snmptrapd >/dev/null || die 'snmptrapd is not installed'
-    ip="$(resolve_bind "$BIND")"; conf="$STATE/snmptrapd.conf"; pid="$STATE/snmptrapd.pid"; log="$STATE/snmptrapd.log"
+    ip="$(resolve_bind "$BIND")"
+    conf="$STATE/snmptrapd.conf"; pid="$STATE/snmptrapd.pid"; log="$STATE/snmptrapd.log"
     echo 'disableAuthorization yes' >"$conf"; : >"$log"
     addr="udp:$ip:$port"; [[ "$ip" == 0.0.0.0 ]] && addr="udp:$port"
     start_bg "$pid" "$log" snmptrapd -f -Lo -C -c "$conf" "$addr"
+    args=(snmp-trap-listen)
+    [[ -n "$BIND" ]] && args+=(--bind "$BIND")
+    (( port != 162 )) && args+=(--port "$port")
+    write_intent snmp-trap "${args[@]}"
     echo "SNMP trap receiver listening on $addr."
     ;;
-snmp-trap-stop) stop_pid "$STATE/snmptrapd.pid"; echo 'SNMP trap receiver stopped.' ;;
-snmp-trap-status) status_pid 'SNMP trap receiver' "$STATE/snmptrapd.pid" "$STATE/snmptrapd.log" ;;
-snmp-trap-tail) touch "$STATE/snmptrapd.log"; tail -f "$STATE/snmptrapd.log" ;;
+snmp-trap-stop)
+    stop_pid "$STATE/snmptrapd.pid"; clear_intent snmp-trap; echo 'SNMP trap receiver stopped.'
+    ;;
+snmp-trap-status)
+    status_pid 'SNMP trap receiver' "$STATE/snmptrapd.pid" "$STATE/snmptrapd.log"
+    ;;
+snmp-trap-tail)
+    sudo_if_needed touch "$STATE/snmptrapd.log"; tail -f "$STATE/snmptrapd.log"
+    ;;
+
 radius-client-add)
     [[ $# -eq 3 ]] || { echo 'Usage: radius-client-add <name> <ip-or-network> <secret>'; exit 2; }
-    mkdir -p "$STATE/radius-clients"; cat >"$STATE/radius-clients/$1.conf" <<EOF
-client $1 {
-    ipaddr = $2
-    secret = $3
+    name="$1"; network="$2"; secret="$3"; valid_name "$name"
+    mkdir -p "$STATE/radius-clients"
+    esc="$(radius_escape "$secret")"
+    cat >"$STATE/radius-clients/$name.conf" <<EOF
+client $name {
+    ipaddr = $network
+    secret = "$esc"
 }
 EOF
-    echo "RADIUS client '$1' saved."
+    chmod 0600 "$STATE/radius-clients/$name.conf"
+    write_intent "radius-client-$name" radius-client-add "$name" "$network" "$secret"
+    echo "RADIUS client '$name' saved."
     ;;
 radius-user-add)
     [[ $# -eq 2 ]] || { echo 'Usage: radius-user-add <username> <password>'; exit 2; }
-    mkdir -p "$STATE/radius-users"; printf '%s Cleartext-Password := "%s"\n' "$1" "$2" >"$STATE/radius-users/$1"
-    echo "RADIUS user '$1' saved."
+    user="$1"; password="$2"; valid_name "$user"
+    mkdir -p "$STATE/radius-users"
+    esc="$(radius_escape "$password")"
+    printf '%s Cleartext-Password := "%s"\n' "$user" "$esc" >"$STATE/radius-users/$user"
+    chmod 0600 "$STATE/radius-users/$user"
+    write_intent "radius-user-$user" radius-user-add "$user" "$password"
+    echo "RADIUS user '$user' saved."
     ;;
-radius-user-delete) [[ $# -eq 1 ]] || exit 2; rm -f "$STATE/radius-users/$1"; echo "RADIUS user '$1' removed." ;;
+radius-user-delete)
+    [[ $# -eq 1 ]] || { echo 'Usage: radius-user-delete <username>'; exit 2; }
+    valid_name "$1"; rm -f "$STATE/radius-users/$1"; clear_intent "radius-user-$1"; echo "RADIUS user '$1' removed."
+    ;;
 radius-server-start)
-    parse_bind "$@"; [[ ${#REST[@]} -eq 0 ]] || die "Unexpected argument: ${REST[0]}"
+    [[ $# -eq 0 ]] || die 'v1.5-dev1 RADIUS uses the standard FreeRADIUS listeners; interface binding is not yet enabled.'
     command -v freeradius >/dev/null || die 'freeradius server is not installed'
-    ip="$(resolve_bind "$BIND")"; root="$STATE/radius"; pid="$STATE/radius.pid"; log="$STATE/radius.log"
-    rm -rf "$root"; cp -a /etc/freeradius/3.0 "$root"
+    root="$STATE/radius-config"; pid="$STATE/radius.pid"; log="$STATE/radius.log"
+    sudo_if_needed rm -rf "$root"
+    sudo_if_needed cp -a /etc/freeradius/3.0 "$root"
+    sudo_if_needed chown -R lab:lab "$root"
     mkdir -p "$STATE/radius-clients" "$STATE/radius-users"
-    cat "$STATE"/radius-clients/*.conf 2>/dev/null >>"$root/clients.conf" || true
-    cat "$STATE"/radius-users/* 2>/dev/null >>"$root/mods-config/files/authorize" || true
-    if [[ "$ip" != 0.0.0.0 ]]; then
-        # Restrict the default auth listener without rewriting the packaged config tree.
-        cat >>"$root/sites-enabled/default" <<EOF
-listen {
-    type = auth
-    ipaddr = $ip
-    port = 18120
-}
-EOF
-        echo "NOTE: custom bind uses auxiliary auth port 18120; default packaged listeners may also remain active."
-    fi
-    : >"$log"; start_bg "$pid" "$log" freeradius -f -l stdout -d "$root"
-    echo 'RADIUS server started.'
+    if compgen -G "$STATE/radius-clients/*.conf" >/dev/null; then cat "$STATE"/radius-clients/*.conf >>"$root/clients.conf"; fi
+    if compgen -G "$STATE/radius-users/*" >/dev/null; then cat "$STATE"/radius-users/* >>"$root/mods-config/files/authorize"; fi
+    : >"$log"
+    start_bg "$pid" "$log" freeradius -f -l stdout -d "$root"
+    write_intent radius-server radius-server-start
+    echo 'RADIUS server started on the packaged standard listeners (development feature).'
     ;;
-radius-server-stop) stop_pid "$STATE/radius.pid"; echo 'RADIUS server stopped.' ;;
-radius-server-status) status_pid 'RADIUS server' "$STATE/radius.pid" "$STATE/radius.log" ;;
-radius-log) touch "$STATE/radius.log"; tail -f "$STATE/radius.log" ;;
-*) die "Unsupported service command '$CMD'" ;;
+radius-server-stop)
+    stop_pid "$STATE/radius.pid"; clear_intent radius-server; echo 'RADIUS server stopped.'
+    ;;
+radius-server-status)
+    status_pid 'RADIUS server' "$STATE/radius.pid" "$STATE/radius.log"
+    ;;
+radius-log)
+    sudo_if_needed touch "$STATE/radius.log"; tail -f "$STATE/radius.log"
+    ;;
+
+services-status)
+    rc=0
+    status_pid 'NTP server' "$STATE/chrony.pid" "$STATE/chrony.log" || rc=1
+    status_pid 'Syslog server' "$STATE/syslog.pid" "$STATE/syslog.log" || rc=1
+    status_pid 'SNMP agent' "$STATE/snmpd.pid" "$STATE/snmpd.log" || rc=1
+    status_pid 'SNMP trap receiver' "$STATE/snmptrapd.pid" "$STATE/snmptrapd.log" || rc=1
+    status_pid 'RADIUS server' "$STATE/radius.pid" "$STATE/radius.log" || rc=1
+    exit "$rc"
+    ;;
+services-reset)
+    stop_pid "$STATE/chrony.pid"
+    stop_pid "$STATE/syslog.pid"
+    stop_pid "$STATE/snmpd.pid"
+    stop_pid "$STATE/snmptrapd.pid"
+    stop_pid "$STATE/radius.pid"
+    sudo_if_needed rm -rf "$STATE"/*
+    rm -f "$INTENT_DIR"/*.conf 2>/dev/null || true
+    echo 'LabHost service runtime and unsaved service intent cleared.'
+    ;;
+*)
+    die "Unsupported service command '$CMD'"
+    ;;
 esac
