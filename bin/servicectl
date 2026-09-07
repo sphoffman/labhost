@@ -20,7 +20,11 @@ valid_name(){ [[ "$1" =~ ^[A-Za-z0-9_.-]+$ ]] || die "Name '$1' contains unsuppo
 ensure_dirs(){
     sudo_if_needed mkdir -p "$STATE" "$INTENT_DIR"
     sudo_if_needed chown lab:lab "$STATE" "$INTENT_DIR" 2>/dev/null || true
-    sudo_if_needed chmod 0700 "$STATE" "$INTENT_DIR" 2>/dev/null || true
+    # Daemons such as FreeRADIUS drop privileges and must be able to traverse
+    # the runtime service root.  Keep saved intent private because it can
+    # contain lab credentials and SNMP communities.
+    sudo_if_needed chmod 0755 "$STATE" 2>/dev/null || true
+    sudo_if_needed chmod 0700 "$INTENT_DIR" 2>/dev/null || true
 }
 ensure_dirs
 
@@ -382,6 +386,10 @@ radius-server-start)
     mkdir -p "$STATE/radius-clients" "$STATE/radius-users"
     if compgen -G "$STATE/radius-clients/*.conf" >/dev/null; then cat "$STATE"/radius-clients/*.conf >>"$root/clients.conf"; fi
     if compgen -G "$STATE/radius-users/*" >/dev/null; then cat "$STATE"/radius-users/* >>"$root/mods-config/files/authorize"; fi
+    # FreeRADIUS drops privileges to freerad.  Give only the generated copy of
+    # its configuration tree to that account; the source intent and credentials
+    # remain lab-owned and mode 0600 outside this tree.
+    sudo_if_needed chown -R freerad:freerad "$root"
     : >"$log"
     start_bg "$pid" "$log" freeradius -f -l stdout -d "$root"
     write_intent radius-server radius-server-start
