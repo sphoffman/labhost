@@ -1,0 +1,58 @@
+name: Validate
+
+on:
+  push:
+    branches:
+      - main
+      - v1.5-dev
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: |
+          bash -n bin/labctl
+          bash -n bin/endpointctl
+          bash -n bin/servicectl
+          bash -n bin/labctl-wrapper
+          bash -n bin/lab-help
+          bash -n bin/lab-reset
+          bash -n bin/pc-phone-create
+          bash -n entrypoint.sh
+          bash -n smoke-test.sh
+      - name: ShellCheck v1.5 helpers
+        run: shellcheck -x bin/endpointctl bin/servicectl
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: labhost:validate
+      - name: Verify helper surface
+        run: |
+          docker run --rm --entrypoint /bin/bash labhost:validate -lc '
+            set -e
+            test "$LABHOST_VERSION" = "1.5-dev1"
+            command -v clients-iperf
+            command -v ntp-server-start
+            command -v syslog-server-start
+            command -v snmp-server-start
+            command -v snmp-trap-listen
+            command -v radius-server-start
+            command -v chronyd
+            command -v snmptrapd
+            command -v freeradius
+          '
