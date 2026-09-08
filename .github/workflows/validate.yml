@@ -21,6 +21,7 @@ jobs:
           bash -n bin/endpointctl
           bash -n bin/servicectl
           bash -n bin/ntp-query
+          bash -n bin/radius-server-start
           bash -n bin/labctl-wrapper
           bash -n bin/lab-help
           bash -n bin/lab-save-v15
@@ -30,7 +31,7 @@ jobs:
           bash -n entrypoint.sh
           bash -n smoke-test.sh
       - name: ShellCheck v1.5 helpers
-        run: shellcheck -x bin/endpointctl bin/servicectl bin/ntp-query bin/lab-save-v15 bin/lab-reset-v15
+        run: shellcheck -x bin/endpointctl bin/servicectl bin/ntp-query bin/radius-server-start bin/lab-save-v15 bin/lab-reset-v15
 
   docker:
     runs-on: ubuntu-latest
@@ -48,7 +49,7 @@ jobs:
         run: |
           docker run --rm --entrypoint /bin/bash labhost:validate -lc '
             set -e
-            test "$LABHOST_VERSION" = "1.5-dev2"
+            test "$LABHOST_VERSION" = "1.5-dev3"
             command -v clients-iperf
             command -v ntp-server-start
             command -v ntp-query
@@ -62,6 +63,7 @@ jobs:
             command -v snmptrapd
             command -v freeradius
             test -x /usr/local/bin/ntp-query
+            test -x /usr/local/bin/radius-server-start
             test -x /usr/local/bin/lab-save
             test -x /usr/local/lib/labhost/lab-reset-core
           '
@@ -111,8 +113,9 @@ jobs:
             grep -q "System clock wrong by" /tmp/ntp-query
 
             radius-user-add ciuser cipass
-            radius-server-start
+            radius-server-start --bind 127.0.0.1
             sleep 1
+            ss -lun | grep -Eq "127\\.0\\.0\\.1:1812"
             radtest ciuser cipass 127.0.0.1 0 testing123 | tee /tmp/radtest
             grep -q "Access-Accept" /tmp/radtest
 
@@ -121,7 +124,7 @@ jobs:
             grep -q "snmp-server-start.*ci-public" /tmp/startup
             grep -q "ntp-server-start" /tmp/startup
             grep -q "radius-user-add.*ciuser" /tmp/startup
-            grep -q "radius-server-start" /tmp/startup
+            grep -q "radius-server-start.*127.0.0.1" /tmp/startup
 
             services-reset
             test ! -e /run/labhost/intents/services/syslog-server.conf
@@ -150,4 +153,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}:1.5-dev2
+          tags: ghcr.io/${{ github.repository }}:1.5-dev3
