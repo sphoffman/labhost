@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Container version, such as 1.4
+        description: Container version, such as 1.5
         required: true
-        default: "1.4"
+        default: "1.5"
 
 env:
   REGISTRY: ghcr.io
