@@ -1,0 +1,116 @@
+#!/bin/bash
+set -euo pipefail
+
+RUN_ROOT=/run/labhost
+STATE="$RUN_ROOT/services"
+INTENT_ROOT="${LABHOST_INTENT_DIR:-$RUN_ROOT/intents}"
+INTENT_DIR="$INTENT_ROOT/services"
+BIND=''
+
+sudo_if_needed(){ if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+ipv4_of(){ ip -4 -o addr show dev "$1" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --bind|--interface)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            BIND="$2"
+            shift 2
+            ;;
+        --bind=*|--interface=*)
+            BIND="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            echo 'Usage: radius-server-start [--bind <interface|IPv4>]'
+            exit 0
+            ;;
+        *) die "Unknown option: $1" ;;
+    esac
+done
+
+command -v freeradius >/dev/null || die 'freeradius server is not installed'
+
+sudo_if_needed mkdir -p "$STATE" "$INTENT_DIR"
+sudo_if_needed chown lab:lab "$STATE" "$INTENT_DIR" 2>/dev/null || true
+sudo_if_needed chmod 0755 "$STATE" 2>/dev/null || true
+sudo_if_needed chmod 0700 "$INTENT_DIR" 2>/dev/null || true
+
+ip=''
+if [[ -n "$BIND" ]]; then
+    if ip link show "$BIND" >/dev/null 2>&1; then
+        ip="$(ipv4_of "$BIND")"
+        [[ -n "$ip" ]] || die "No global IPv4 address on $BIND"
+    elif [[ "$BIND" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ip="$BIND"
+    else
+        die "Bind target '$BIND' is not an interface or IPv4 address"
+    fi
+fi
+
+root="$STATE/radius-config"
+pidfile="$STATE/radius.pid"
+log="$STATE/radius.log"
+
+if [[ -r "$pidfile" ]]; then
+    oldpid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ "$oldpid" =~ ^[0-9]+$ ]] && ps -p "$oldpid" >/dev/null 2>&1; then
+        sudo_if_needed kill "$oldpid" 2>/dev/null || true
+        for _ in {1..20}; do
+            ps -p "$oldpid" >/dev/null 2>&1 || break
+            sleep 0.1
+        done
+        ps -p "$oldpid" >/dev/null 2>&1 && sudo_if_needed kill -KILL "$oldpid" 2>/dev/null || true
+    fi
+fi
+sudo_if_needed rm -f "$pidfile"
+
+sudo_if_needed rm -rf "$root"
+sudo_if_needed cp -a /etc/freeradius/3.0 "$root"
+sudo_if_needed chown -R lab:lab "$root"
+mkdir -p "$STATE/radius-clients" "$STATE/radius-users"
+
+if compgen -G "$STATE/radius-clients/*.conf" >/dev/null; then
+    cat "$STATE"/radius-clients/*.conf >>"$root/clients.conf"
+fi
+if compgen -G "$STATE/radius-users/*" >/dev/null; then
+    cat "$STATE"/radius-users/* >>"$root/mods-config/files/authorize"
+fi
+
+# FreeRADIUS drops privileges to freerad. Only the generated runtime copy is
+# handed to that account; the source intent remains lab-owned and mode 0600.
+sudo_if_needed chown -R freerad:freerad "$root"
+sudo_if_needed touch "$log"
+sudo_if_needed chmod 0644 "$log"
+
+args=(freeradius -f -l stdout -d "$root")
+if [[ -n "$ip" ]]; then
+    # FreeRADIUS 3 requires -i and -p together. Supplying them overrides all
+    # configured listen sections, binding auth to 1812 and accounting to 1813.
+    args+=(-i "$ip" -p 1812)
+fi
+
+sudo_if_needed bash -c 'pidfile="$1"; logfile="$2"; shift 2; nohup "$@" >>"$logfile" 2>&1 & echo $! >"$pidfile"' _ "$pidfile" "$log" "${args[@]}"
+sleep 0.5
+
+newpid="$(cat "$pidfile" 2>/dev/null || true)"
+if [[ ! "$newpid" =~ ^[0-9]+$ ]] || ! ps -p "$newpid" >/dev/null 2>&1; then
+    tail -40 "$log" 2>/dev/null || true
+    die 'RADIUS server did not remain running'
+fi
+
+intent="$INTENT_DIR/.radius-server.tmp.$$"
+if [[ -n "$BIND" ]]; then
+    printf 'radius-server-start --bind %q\n' "$BIND" >"$intent"
+else
+    printf 'radius-server-start\n' >"$intent"
+fi
+chmod 0600 "$intent"
+mv -f "$intent" "$INTENT_DIR/radius-server.conf"
+
+if [[ -n "$ip" ]]; then
+    echo "RADIUS server listening on ${ip}:1812 (auth) and ${ip}:1813 (accounting)."
+else
+    echo 'RADIUS server started on the packaged standard listeners.'
+fi
