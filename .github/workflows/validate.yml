@@ -53,7 +53,7 @@ jobs:
         run: |
           docker run --rm --entrypoint /bin/bash labhost:validate -lc '
             set -e
-            test "$LABHOST_VERSION" = "1.5-dev7"
+            test "$LABHOST_VERSION" = "1.5-dev8"
             grep -q "labhost ${LABHOST_VERSION} -" /etc/motd
             command -v clients-iperf
             command -v ntp-server-start
@@ -152,6 +152,27 @@ jobs:
             test "$(sysctl -n net.ipv4.conf.cl001.arp_announce)" = "2"
           '
 
+      - name: Verify root-owned config bind persistence
+        run: |
+          config_dir="$RUNNER_TEMP/labhost-root-config"
+          mkdir -p "$config_dir"
+          sudo chown root:root "$config_dir"
+          sudo chmod 0755 "$config_dir"
+          docker run --rm \
+            -v "$config_dir:/config" \
+            --entrypoint /bin/bash labhost:validate -lc '
+              set -e
+              mkdir -p /run/labhost/intents
+              chown -R lab:lab /run/labhost/intents
+              host="$(hostname -s)"
+              sudo -u lab -H bash -lc "lab-save"
+              test "$(stat -c "%U:%G %a" "/config/${host}.sh")" = "root:root 755"
+              sudo -u lab -H bash -lc "lab-save"
+              test "$(stat -c "%U:%G %a" "/config/${host}.sh")" = "root:root 755"
+              test "$(stat -c "%U:%G %a" "/config/${host}.sh.bak")" = "root:root 755"
+            '
+          test "$(stat -c "%U:%G %a" "$config_dir")" = "root:root 755"
+
       - name: Verify PC endpoint defaults
         run: |
           docker run --rm --privileged --entrypoint /bin/bash labhost:validate -lc '
@@ -249,4 +270,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}:1.5-dev7
+          tags: ghcr.io/${{ github.repository }}:1.5-dev8
