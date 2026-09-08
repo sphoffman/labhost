@@ -20,6 +20,7 @@ jobs:
           bash -n bin/labctl
           bash -n bin/endpointctl
           bash -n bin/servicectl
+          bash -n bin/ntp-query
           bash -n bin/labctl-wrapper
           bash -n bin/lab-help
           bash -n bin/lab-save-v15
@@ -29,7 +30,7 @@ jobs:
           bash -n entrypoint.sh
           bash -n smoke-test.sh
       - name: ShellCheck v1.5 helpers
-        run: shellcheck -x bin/endpointctl bin/servicectl bin/lab-save-v15 bin/lab-reset-v15
+        run: shellcheck -x bin/endpointctl bin/servicectl bin/ntp-query bin/lab-save-v15 bin/lab-reset-v15
 
   docker:
     runs-on: ubuntu-latest
@@ -47,9 +48,10 @@ jobs:
         run: |
           docker run --rm --entrypoint /bin/bash labhost:validate -lc '
             set -e
-            test "$LABHOST_VERSION" = "1.5-dev1"
+            test "$LABHOST_VERSION" = "1.5-dev2"
             command -v clients-iperf
             command -v ntp-server-start
+            command -v ntp-query
             command -v syslog-server-start
             command -v snmp-server-start
             command -v snmp-trap-listen
@@ -59,6 +61,7 @@ jobs:
             command -v chronyd
             command -v snmptrapd
             command -v freeradius
+            test -x /usr/local/bin/ntp-query
             test -x /usr/local/bin/lab-save
             test -x /usr/local/lib/labhost/lab-reset-core
           '
@@ -104,6 +107,8 @@ jobs:
 
             ntp-server-start --bind 127.0.0.1
             ntp-server-status >/dev/null
+            ntp-query 127.0.0.1 | tee /tmp/ntp-query
+            grep -q "System clock wrong by" /tmp/ntp-query
 
             radius-user-add ciuser cipass
             radius-server-start
@@ -145,4 +150,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}:1.5-dev1
+          tags: ghcr.io/${{ github.repository }}:1.5-dev2
