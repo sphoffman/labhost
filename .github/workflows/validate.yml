@@ -19,6 +19,7 @@ jobs:
         run: |
           bash -n bin/labctl
           bash -n bin/endpointctl
+          bash -n bin/endpointctl-wrapper
           bash -n bin/servicectl
           bash -n bin/ntp-query
           bash -n bin/radius-server-start
@@ -30,8 +31,10 @@ jobs:
           bash -n bin/pc-phone-create
           bash -n entrypoint.sh
           bash -n smoke-test.sh
+      - name: Python syntax
+        run: python3 -m py_compile lib/pc_phone_lldp.py
       - name: ShellCheck v1.5 helpers
-        run: shellcheck -x bin/endpointctl bin/servicectl bin/ntp-query bin/radius-server-start bin/lab-save-v15 bin/lab-reset-v15
+        run: shellcheck -x bin/endpointctl bin/endpointctl-wrapper bin/servicectl bin/ntp-query bin/radius-server-start bin/lab-save-v15 bin/lab-reset-v15
 
   docker:
     runs-on: ubuntu-latest
@@ -49,7 +52,7 @@ jobs:
         run: |
           docker run --rm --entrypoint /bin/bash labhost:validate -lc '
             set -e
-            test "$LABHOST_VERSION" = "1.5-dev5"
+            test "$LABHOST_VERSION" = "1.5-dev6"
             grep -q "labhost ${LABHOST_VERSION} -" /etc/motd
             command -v clients-iperf
             command -v ntp-server-start
@@ -63,10 +66,14 @@ jobs:
             command -v chronyd
             command -v snmptrapd
             command -v freeradius
+            test -x /usr/local/lib/labhost/endpointctl-wrapper
             test -x /usr/local/bin/ntp-query
             test -x /usr/local/bin/radius-server-start
             test -x /usr/local/bin/lab-save
             test -x /usr/local/lib/labhost/lab-reset-core
+            iperf-server --help | grep -q "iperf-server \[port\] \[--interface <iface>\]"
+            lab-help iperf-server | grep -q "iperf-server \[port\] \[--interface <iface>\]"
+            lab-help | grep -q clients-iperf
           '
       - name: Verify endpoint discovery
         run: |
@@ -92,6 +99,50 @@ jobs:
             grep -q "pp-eth1-v1111.*pc-phone.*phone" /tmp/endpoints
             clients-status --pcs | grep -q pp-eth1-pc
             clients-status --phones | grep -q pp-eth1-v1111
+          '
+      - name: Verify dev6 endpoint defaults and ip-set semantics
+        run: |
+          docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW --entrypoint /bin/bash labhost:validate -lc '
+            set -e
+
+            ip link add eth1 type dummy
+            ip link set eth1 mtu 9000
+            ip link set eth1 up
+            ip addr add 192.0.2.2/24 dev eth1
+            ip-set eth1 10.10.10.20/24
+            ip -4 -o addr show dev eth1 | tee /tmp/eth1-addrs
+            grep -q "10.10.10.20/24" /tmp/eth1-addrs
+            ! grep -q "192.0.2.2/24" /tmp/eth1-addrs
+
+            clients-create eth1 1 198.51.100.0/24 10
+            client="$(ip -o link show type macvlan | awk -F": " "{print \\$2}" | cut -d@ -f1 | grep -E "^cl[0-9]+$" | head -1)"
+            test -n "$client"
+            test "$(cat /sys/class/net/$client/mtu)" = "1500"
+            test "$(sysctl -n net.ipv4.conf.$client.arp_ignore)" = "1"
+            test "$(sysctl -n net.ipv4.conf.$client.arp_announce)" = "2"
+
+            ip link add eth2 type dummy
+            ip link set eth2 mtu 9000
+            ip link set eth2 up
+            pc-phone-create eth2 --no-dhcp
+            test "$(cat /sys/class/net/pp-eth2-pc/mtu)" = "1500"
+            test "$(sysctl -n net.ipv4.conf.pp-eth2-pc.arp_ignore)" = "1"
+            test "$(sysctl -n net.ipv4.conf.pp-eth2-pc.arp_announce)" = "2"
+            pc-phone-delete eth2
+
+            ip link add eth3 type dummy
+            ip link set eth3 mtu 9000
+            ip link set eth3 up
+            python3 - <<"PY"
+import importlib.util
+spec=importlib.util.spec_from_file_location("pc_phone_lldp","/usr/local/lib/labhost/pc_phone_lldp.py")
+mod=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.provision("eth3","02:00:00:00:11:11",1111,True,0,0,"/tmp/eth3.state",False)
+PY
+            test "$(cat /sys/class/net/pp-eth3-v1111/mtu)" = "1500"
+            test "$(sysctl -n net.ipv4.conf.pp-eth3-v1111.arp_ignore)" = "1"
+            test "$(sysctl -n net.ipv4.conf.pp-eth3-v1111.arp_announce)" = "2"
           '
       - name: Verify lightweight services and persistence
         run: |
@@ -163,4 +214,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}:1.5-dev5
+          tags: ghcr.io/${{ github.repository }}:1.5-dev6
