@@ -19,10 +19,23 @@ interface. DHCP is enabled by default.
 
 The command is restart-safe: if working intent exists but the runtime
 PC/phone state is missing or stale, it rebuilds the object automatically.
+Synthetic PC/phone child endpoints default to MTU 1500.
 EOF
 }
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+sudo_if_needed() { if [[ $EUID -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+
+converge_pc_endpoint() {
+    [[ -e "/sys/class/net/$pc" ]] || return 0
+    sudo_if_needed ip link set "$pc" mtu 1500
+    if [[ "$(sysctl -n "net.ipv4.conf.${pc}.arp_ignore" 2>/dev/null || true)" != "1" ]]; then
+        sudo_if_needed sysctl -w "net.ipv4.conf.${pc}.arp_ignore=1" >/dev/null
+    fi
+    if [[ "$(sysctl -n "net.ipv4.conf.${pc}.arp_announce" 2>/dev/null || true)" != "2" ]]; then
+        sudo_if_needed sysctl -w "net.ipv4.conf.${pc}.arp_announce=2" >/dev/null
+    fi
+}
 
 [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]] && { usage; exit 0; }
 [[ $# -ge 1 ]] || { usage; exit 2; }
@@ -72,6 +85,7 @@ fi
 if [[ -r "$intent" ]]; then
     existing_intent="$(tr -d '\r\n' < "$intent")"
     if (( runtime_healthy )) && [[ "$existing_intent" == "$requested_intent" ]]; then
+        converge_pc_endpoint
         echo "PC/phone already healthy on $parent; no changes made."
         exit 0
     fi
@@ -85,7 +99,9 @@ fi
 # obsolete persistent intent path. The dhcpcd shim already supplies stable
 # Ethernet client IDs for pp-*-pc interfaces, so no DHCP reacquire is needed.
 if (( dhcp )); then
-    exec "$CORE" pc-phone-create "$parent"
+    "$CORE" pc-phone-create "$parent"
 else
-    exec "$CORE" pc-phone-create "$parent" --no-dhcp
+    "$CORE" pc-phone-create "$parent" --no-dhcp
 fi
+
+converge_pc_endpoint
