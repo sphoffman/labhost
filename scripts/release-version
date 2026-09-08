@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+raw="${1:-}"
+version="${raw#v}"
+
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "Unsupported release version: $raw" >&2
+    exit 1
+fi
+
+printf '%s\n' "$version"
