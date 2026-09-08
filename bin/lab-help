@@ -13,9 +13,18 @@ EOF
     exit 0
 fi
 
+case "${1:-}" in
+    clients-list|clients-status|clients-arp|clients-ping|clients-traffic|clients-iperf|\
+    iperf-server|iperf-client|iperf-udp|iperf-reverse|iperf-bidir|iperf-parallel|iperf-bind|iperf-test|\
+    path-test|send-tcp|send-udp|send-broadcast)
+        exec "/usr/local/bin/$1" --help
+        ;;
+esac
+
 if [[ $# -eq 0 ]]; then
     /usr/local/bin/labctl lab-help | sed \
-        's/dhcp-server-stop dhcp-server-status tftp-server/dhcp-server-stop dhcp-server-status dhcp-leases tftp-server/'
+        -e 's/dhcp-server-stop dhcp-server-status tftp-server/dhcp-server-stop dhcp-server-status dhcp-leases tftp-server/' \
+        -e 's/clients-ping clients-traffic endpoint-move/clients-ping clients-traffic clients-iperf endpoint-move/'
     exit 0
 fi
 
