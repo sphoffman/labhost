@@ -100,11 +100,10 @@ jobs:
             clients-status --pcs | grep -q pp-eth1-pc
             clients-status --phones | grep -q pp-eth1-v1111
           '
-      - name: Verify dev6 endpoint defaults and ip-set semantics
+      - name: Verify ip-set replacement semantics
         run: |
-          docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW --entrypoint /bin/bash labhost:validate -lc '
+          docker run --rm --cap-add NET_ADMIN --entrypoint /bin/bash labhost:validate -lc '
             set -e
-
             ip link add eth1 type dummy
             ip link set eth1 mtu 9000
             ip link set eth1 up
@@ -113,14 +112,25 @@ jobs:
             ip -4 -o addr show dev eth1 | tee /tmp/eth1-addrs
             grep -q "10.10.10.20/24" /tmp/eth1-addrs
             ! grep -q "192.0.2.2/24" /tmp/eth1-addrs
-
+          '
+      - name: Verify synthetic client defaults
+        run: |
+          docker run --rm --cap-add NET_ADMIN --entrypoint /bin/bash labhost:validate -lc '
+            set -e
+            ip link add eth1 type dummy
+            ip link set eth1 mtu 9000
+            ip link set eth1 up
             clients-create eth1 1 198.51.100.0/24 10
             client="$(ip -o link show type macvlan | grep -oE "cl[0-9]+" | head -1)"
             test -n "$client"
             test "$(cat /sys/class/net/$client/mtu)" = "1500"
             test "$(sysctl -n net.ipv4.conf.$client.arp_ignore)" = "1"
             test "$(sysctl -n net.ipv4.conf.$client.arp_announce)" = "2"
-
+          '
+      - name: Verify PC endpoint defaults
+        run: |
+          docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW --entrypoint /bin/bash labhost:validate -lc '
+            set -e
             ip link add eth2 type dummy
             ip link set eth2 mtu 9000
             ip link set eth2 up
@@ -129,7 +139,11 @@ jobs:
             test "$(sysctl -n net.ipv4.conf.pp-eth2-pc.arp_ignore)" = "1"
             test "$(sysctl -n net.ipv4.conf.pp-eth2-pc.arp_announce)" = "2"
             pc-phone-delete eth2
-
+          '
+      - name: Verify tagged phone endpoint defaults
+        run: |
+          docker run --rm --cap-add NET_ADMIN --entrypoint /bin/bash labhost:validate -lc '
+            set -e
             ip link add eth3 type dummy
             ip link set eth3 mtu 9000
             ip link set eth3 up
