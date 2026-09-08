@@ -6,6 +6,28 @@ INTENT_ROOT="${LABHOST_INTENT_DIR:-/run/labhost/intents}"
 SERVICE_INTENT_DIR="$INTENT_ROOT/services"
 STARTUP="/config/$(hostname -s).sh"
 
+normalize_startup(){
+    # Synthetic clients are recreated from clients-create intent, but the core
+    # saver emits generic MTU state before that intent. Defer clN MTU commands
+    # until the end of the base startup so replay never references a synthetic
+    # interface before it exists. This also preserves deliberate non-1500 MTU
+    # overrides instead of simply dropping synthetic-client MTU state.
+    awk '
+        /^mtu-set cl[0-9]+ [0-9]+$/ {
+            deferred[++count] = $0
+            next
+        }
+        { print }
+        END {
+            if (count > 0) {
+                print ""
+                print "# Synthetic client MTU state (after clients-create)"
+                for (i = 1; i <= count; i++) print deferred[i]
+            }
+        }
+    '
+}
+
 emit_services(){
     local f found=0
     [[ -d "$SERVICE_INTENT_DIR" ]] || return 0
@@ -42,7 +64,7 @@ fi
 
 if [[ "${1:-}" == "--dry-run" ]]; then
     [[ $# -eq 1 ]] || { echo 'Usage: lab-save [--dry-run]' >&2; exit 2; }
-    "$CORE" lab-save --dry-run
+    "$CORE" lab-save --dry-run | normalize_startup
     emit_services
     exit 0
 fi
@@ -53,11 +75,17 @@ fi
 # file first, including its backup/root-owned bind-mount handling.
 "$CORE" lab-save
 
+# Normalize synthetic-client dependencies before appending v1.5 service intent.
+# The core saver already created the .bak before this rewrite.
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+normalize_startup <"$STARTUP" >"$tmp"
+sudo install -o root -g root -m 0755 "$tmp" "$STARTUP"
+
 if compgen -G "$SERVICE_INTENT_DIR/*.conf" >/dev/null; then
-    tmp="$(mktemp)"
+    : >"$tmp"
     emit_services >"$tmp"
     sudo dd if="$tmp" of="$STARTUP" oflag=append conv=notrunc status=none
-    rm -f "$tmp"
     sudo chown root:root "$STARTUP"
     sudo chmod 0755 "$STARTUP"
     echo "Appended LabHost v1.5 service intent to $STARTUP"
