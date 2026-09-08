@@ -1,15 +1,14 @@
 name: labhost-v15-dev
 
 mgmt:
-  network: clab
-  ipv4-subnet: 172.20.21.0/24
+  network: labhost-v15-dev-mgmt
+  ipv4-subnet: auto
 
 topology:
   nodes:
     host1:
       kind: linux
       image: ghcr.io/sphoffman/labhost:1.5-dev1
-      mgmt-ipv4: 172.20.21.101
       env:
         LAB_PASSWORD: lab
       sysctls:
@@ -21,7 +20,6 @@ topology:
     host2:
       kind: linux
       image: ghcr.io/sphoffman/labhost:1.5-dev1
-      mgmt-ipv4: 172.20.21.102
       env:
         LAB_PASSWORD: lab
       sysctls:
