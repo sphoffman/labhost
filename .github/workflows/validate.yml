@@ -115,7 +115,7 @@ jobs:
             ! grep -q "192.0.2.2/24" /tmp/eth1-addrs
 
             clients-create eth1 1 198.51.100.0/24 10
-            client="$(ip -o link show type macvlan | awk -F": " "{print \\$2}" | cut -d@ -f1 | grep -E "^cl[0-9]+$" | head -1)"
+            client="$(ip -o link show type macvlan | grep -oE "cl[0-9]+" | head -1)"
             test -n "$client"
             test "$(cat /sys/class/net/$client/mtu)" = "1500"
             test "$(sysctl -n net.ipv4.conf.$client.arp_ignore)" = "1"
