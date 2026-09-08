@@ -121,7 +121,9 @@ jobs:
             ip link set eth1 mtu 9000
             ip link set eth1 up
             clients-create eth1 1 198.51.100.0/24 10
-            ip link show cl001 >/dev/null
+            client="$(find /sys/class/net -maxdepth 1 -type l -name "cl*" -printf "%f\n" | head -1)"
+            test -n "$client"
+            ip link show "$client" >/dev/null
           '
       - name: Verify synthetic client MTU
         run: |
@@ -131,7 +133,9 @@ jobs:
             ip link set eth1 mtu 9000
             ip link set eth1 up
             clients-create eth1 1 198.51.100.0/24 10
-            test "$(cat /sys/class/net/cl001/mtu)" = "1500"
+            client="$(find /sys/class/net -maxdepth 1 -type l -name "cl*" -printf "%f\n" | head -1)"
+            test -n "$client"
+            test "$(cat /sys/class/net/$client/mtu)" = "1500"
           '
       - name: Verify synthetic client ARP isolation
         run: |
@@ -141,8 +145,10 @@ jobs:
             ip link set eth1 mtu 9000
             ip link set eth1 up
             clients-create eth1 1 198.51.100.0/24 10
-            test "$(sysctl -n net.ipv4.conf.cl001.arp_ignore)" = "1"
-            test "$(sysctl -n net.ipv4.conf.cl001.arp_announce)" = "2"
+            client="$(find /sys/class/net -maxdepth 1 -type l -name "cl*" -printf "%f\n" | head -1)"
+            test -n "$client"
+            test "$(sysctl -n net.ipv4.conf.$client.arp_ignore)" = "1"
+            test "$(sysctl -n net.ipv4.conf.$client.arp_announce)" = "2"
           '
       - name: Verify PC endpoint defaults
         run: |
