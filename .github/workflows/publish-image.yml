@@ -38,15 +38,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve image version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            raw="${{ github.event.release.tag_name }}"
+          else
+            raw="${{ inputs.version }}"
+          fi
+
+          version="$(bash scripts/release-version "$raw")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Generate image metadata
         id: metadata
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}},value=${{ github.event.release.tag_name }},enable=${{ github.event_name == 'release' }}
-            type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=latest
+
+      - name: Verify image tags
+        shell: bash
+        env:
+          IMAGE_TAGS: ${{ steps.metadata.outputs.tags }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          grep -Fxq "ghcr.io/${GITHUB_REPOSITORY}:${VERSION}" <<<"$IMAGE_TAGS"
+          grep -Fxq "ghcr.io/${GITHUB_REPOSITORY}:latest" <<<"$IMAGE_TAGS"
 
       - name: Build and publish image
         uses: docker/build-push-action@v6
