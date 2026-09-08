@@ -49,7 +49,7 @@ jobs:
         run: |
           docker run --rm --entrypoint /bin/bash labhost:validate -lc '
             set -e
-            test "$LABHOST_VERSION" = "1.5-dev3"
+            test "$LABHOST_VERSION" = "1.5-dev4"
             command -v clients-iperf
             command -v ntp-server-start
             command -v ntp-query
@@ -112,6 +112,7 @@ jobs:
             ntp-query 127.0.0.1 | tee /tmp/ntp-query
             grep -q "System clock wrong by" /tmp/ntp-query
 
+            radius-client-add ci-unused 192.0.2.0/24 cilabsecret
             radius-user-add ciuser cipass
             radius-server-start --bind 127.0.0.1
             sleep 1
@@ -123,8 +124,16 @@ jobs:
             grep -q "syslog-server-start.*5514" /tmp/startup
             grep -q "snmp-server-start.*ci-public" /tmp/startup
             grep -q "ntp-server-start" /tmp/startup
+            grep -q "radius-client-add.*ci-unused" /tmp/startup
             grep -q "radius-user-add.*ciuser" /tmp/startup
             grep -q "radius-server-start.*127.0.0.1" /tmp/startup
+
+            client_line="$(grep -n "^radius-client-add ci-unused " /tmp/startup | cut -d: -f1)"
+            user_line="$(grep -n "^radius-user-add ciuser " /tmp/startup | cut -d: -f1)"
+            server_line="$(grep -n "^radius-server-start" /tmp/startup | cut -d: -f1)"
+            test -n "$client_line" && test -n "$user_line" && test -n "$server_line"
+            test "$client_line" -lt "$server_line"
+            test "$user_line" -lt "$server_line"
 
             services-reset
             test ! -e /run/labhost/intents/services/syslog-server.conf
@@ -153,4 +162,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}:1.5-dev3
+          tags: ghcr.io/${{ github.repository }}:1.5-dev4
