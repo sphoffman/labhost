@@ -9,6 +9,7 @@ import argparse, os, socket, struct, subprocess, time
 
 LLDP_DST = bytes.fromhex('0180c200000e')
 MED_OUI = bytes.fromhex('0012bb')
+ENDPOINT_MTU = '1500'
 
 def tlv(t, value):
     h=(t<<9)|len(value)
@@ -51,6 +52,9 @@ def parse_med(pkt):
 def run(*args): subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def exists(dev): return subprocess.run(['ip','link','show',dev],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
 
+def sysctl_set(key, value):
+    subprocess.run(['sysctl','-q','-w',f'{key}={value}'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+
 def dhcp_start(iface, mac):
     # Explicit RFC2132 Ethernet client identifier: type 1 + deterministic MAC.
     # dhcpcd otherwise derives an IAID from the VLAN ID for VLAN interfaces,
@@ -70,7 +74,12 @@ def provision(parent, phone_mac, vlan, tagged, prio, dscp, statefile, dhcp):
             if line.startswith('voice_iface='): old=line.strip().split('=',1)[1]
     if old and old != voice and old != parent and exists(old): run('ip','link','del',old)
     if not exists(voice): run('ip','link','add','link',parent,'name',voice,'type','vlan','id',str(vlan))
-    run('ip','link','set',voice,'down'); run('ip','link','set',voice,'address',phone_mac); run('ip','link','set',voice,'up')
+    run('ip','link','set',voice,'down')
+    run('ip','link','set',voice,'mtu',ENDPOINT_MTU)
+    run('ip','link','set',voice,'address',phone_mac)
+    run('ip','link','set',voice,'up')
+    sysctl_set(f'net.ipv4.conf.{voice}.arp_ignore', '1')
+    sysctl_set(f'net.ipv4.conf.{voice}.arp_announce', '2')
     if dhcp: dhcp_start(voice, phone_mac)
     with open(statefile,'w') as f: f.write(f'vlan={vlan}\ntagged=1\npriority={prio}\ndscp={dscp}\nvoice_iface={voice}\n')
 
