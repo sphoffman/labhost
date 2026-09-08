@@ -5,33 +5,100 @@ cmd="$(basename "$0")"
 core=/usr/local/lib/labhost/labctl
 
 # High-level intent files are working metadata used by lab-save to reconstruct
-# commands that cannot be inferred reliably from Linux runtime state.  Keep
+# commands that cannot be inferred reliably from Linux runtime state. Keep
 # them under /run so creating an object does not make it persistent by itself.
 # /config/<hostname>.sh remains the single authoritative saved configuration.
 export LABHOST_INTENT_DIR="${LABHOST_INTENT_DIR:-/run/labhost/intents}"
 
-# Keep exactly one authoritative reset implementation.  The public lab-reset
+sudo_if_needed() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+list_managed_clients() {
+    ip -o link show type macvlan 2>/dev/null \
+        | awk -F': ' '{print $2}' \
+        | cut -d@ -f1 \
+        | grep -E '^cl[0-9]+$' \
+        | sort -V \
+        || true
+}
+
+# Normalize symlink invocation (ip-set, clients-create, etc.) and explicit
+# `labctl <command>` invocation so both paths get identical v1.5 semantics.
+if [[ "$cmd" == "labctl" ]]; then
+    if [[ $# -eq 0 ]]; then
+        exec "$core"
+    fi
+    dispatch="$1"
+    shift
+else
+    dispatch="$cmd"
+fi
+
+# Keep exactly one authoritative reset implementation. The public lab-reset
 # command is the hardened, regression-tested path; make `labctl lab-reset`
 # converge on that same implementation rather than the legacy case statement
 # still present in the monolithic core.
-if [[ "$cmd" == "labctl" && "${1:-}" == "lab-reset" ]]; then
-    shift
+if [[ "$dispatch" == "lab-reset" ]]; then
     exec /usr/local/bin/lab-reset "$@"
 fi
 
 # pc-phone-create has a public convergence wrapper that validates runtime state
-# before deciding an object is already present. Route the explicit labctl form
-# through that same wrapper so both entry points have identical semantics.
-if [[ "$cmd" == "labctl" && "${1:-}" == "pc-phone-create" ]]; then
-    shift
+# before deciding an object is already present. Route both entry points through
+# that same wrapper so they have identical semantics.
+if [[ "$dispatch" == "pc-phone-create" ]]; then
     exec /usr/local/bin/pc-phone-create "$@"
 fi
 
-# Friendly commands such as ip-set are symlinks to this dispatcher.  Feed the
-# invoked command name to the core as labctl's first argument so the existing
-# command dispatch semantics remain unchanged.
-if [[ "$cmd" == "labctl" ]]; then
-    exec "$core" "$@"
-else
-    exec "$core" "$cmd" "$@"
+# Static ip-set means "set this interface's IPv4 address", not "add another
+# unrelated global IPv4 address". Let the proven core first validate/apply the
+# requested address (and clear DHCP intent when needed), then remove other
+# global IPv4 addresses only after the new configuration succeeded.
+if [[ "$dispatch" == "ip-set" ]]; then
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || $# -lt 2 || "${2:-}" == "dhcp" ]]; then
+        exec "$core" ip-set "$@"
+    fi
+
+    iface="$1"
+    requested="$2"
+    "$core" ip-set "$@"
+
+    requested_ip="${requested%/*}"
+    while read -r existing; do
+        [[ -n "$existing" ]] || continue
+        [[ "${existing%/*}" == "$requested_ip" ]] && continue
+        sudo_if_needed ip -4 addr del "$existing" dev "$iface"
+    done < <(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4}')
+    exit 0
 fi
+
+# Synthetic clients should behave like ordinary endpoint hosts even when their
+# LabHost parent stays jumbo-capable. Apply the v1.5 endpoint default (1500)
+# only to newly created clN interfaces, preserving deliberate later overrides.
+if [[ "$dispatch" == "clients-create" ]]; then
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        exec "$core" clients-create "$@"
+    fi
+
+    before_file="$(mktemp)"
+    trap 'rm -f "$before_file"' EXIT
+    list_managed_clients >"$before_file"
+
+    "$core" clients-create "$@"
+
+    while read -r iface; do
+        [[ -n "$iface" ]] || continue
+        grep -Fxq "$iface" "$before_file" && continue
+        sudo_if_needed ip link set "$iface" mtu 1500
+    done < <(list_managed_clients)
+    exit 0
+fi
+
+# Friendly commands such as vlan-create are symlinks to this dispatcher. Feed
+# the invoked command name to the core as labctl's first argument so the
+# existing command dispatch semantics remain unchanged.
+exec "$core" "$dispatch" "$@"
