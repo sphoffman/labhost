@@ -23,7 +23,7 @@ FROM debian:13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENV LABHOST_VERSION="1.5-dev2"
+ENV LABHOST_VERSION="1.5-dev3"
 
 RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' | debconf-set-selections \
     && echo 'iperf3 iperf3/start_daemon boolean false' | debconf-set-selections \
@@ -43,6 +43,7 @@ COPY bin/labctl /usr/local/lib/labhost/labctl
 COPY bin/endpointctl /usr/local/lib/labhost/endpointctl
 COPY bin/servicectl /usr/local/lib/labhost/servicectl
 COPY bin/ntp-query /usr/local/lib/labhost/ntp-query
+COPY bin/radius-server-start /usr/local/lib/labhost/radius-server-start
 COPY bin/lab-reset /usr/local/lib/labhost/lab-reset-core
 COPY bin/labctl-wrapper /usr/local/bin/labctl
 COPY bin/lab-help /usr/local/bin/lab-help
@@ -57,7 +58,7 @@ COPY motd /etc/motd
 
 RUN chmod 0755 \
         /usr/local/lib/labhost/labctl /usr/local/lib/labhost/endpointctl /usr/local/lib/labhost/servicectl \
-        /usr/local/lib/labhost/ntp-query /usr/local/lib/labhost/lab-reset-core \
+        /usr/local/lib/labhost/ntp-query /usr/local/lib/labhost/radius-server-start /usr/local/lib/labhost/lab-reset-core \
         /usr/local/bin/labctl /usr/local/bin/lab-help /usr/local/bin/lab-save /usr/local/bin/lab-reset \
         /usr/local/bin/dhcp-leases /usr/local/bin/pc-phone-create \
         /usr/local/bin/labhost-entrypoint /usr/local/lib/labhost/pc_phone_lldp.py \
@@ -93,7 +94,8 @@ RUN chmod 0755 \
         radius-client-add radius-user-add radius-user-delete radius-server-start radius-server-stop radius-server-status radius-log \
         services-status services-reset; \
       do ln -s /usr/local/lib/labhost/servicectl "/usr/local/bin/$cmd"; done \
-    && ln -sf /usr/local/lib/labhost/ntp-query /usr/local/bin/ntp-query
+    && ln -sf /usr/local/lib/labhost/ntp-query /usr/local/bin/ntp-query \
+    && ln -sf /usr/local/lib/labhost/radius-server-start /usr/local/bin/radius-server-start
 
 RUN useradd -m -s /bin/bash lab \
     && echo 'lab ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/lab \
