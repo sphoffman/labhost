@@ -1,0 +1,20 @@
+#!/bin/bash
+set -euo pipefail
+
+cmd="$(basename "$0")"
+core=/usr/local/lib/labhost/endpointctl
+
+# Endpoint-aware commands are exposed as symlinks to this wrapper. Preserve
+# the public command name when dispatching into endpointctl, and make -h/--help
+# consistently show the v1.5 endpoint-aware syntax instead of being consumed
+# as a positional iperf argument.
+if [[ "$cmd" == "endpointctl-wrapper" ]]; then
+    cmd="${1:-help}"
+    shift || true
+fi
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    exec "$core" help
+fi
+
+exec "$core" "$cmd" "$@"
