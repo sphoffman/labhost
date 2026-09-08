@@ -8,9 +8,11 @@ topology:
   nodes:
     host1:
       kind: linux
-      image: ghcr.io/sphoffman/labhost:1.5-dev4
+      image: ghcr.io/sphoffman/labhost:1.5-dev5
       env:
         LAB_PASSWORD: lab
+      binds:
+        - ./labhost-v1.5-dev-configs:/config
       sysctls:
         net.ipv4.tcp_l3mdev_accept: 1
       cap-add:
@@ -19,9 +21,11 @@ topology:
 
     host2:
       kind: linux
-      image: ghcr.io/sphoffman/labhost:1.5-dev4
+      image: ghcr.io/sphoffman/labhost:1.5-dev5
       env:
         LAB_PASSWORD: lab
+      binds:
+        - ./labhost-v1.5-dev-configs:/config
       sysctls:
         net.ipv4.tcp_l3mdev_accept: 1
       cap-add:
