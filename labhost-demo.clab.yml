@@ -8,31 +8,35 @@ topology:
   nodes:
     client1:
       kind: linux
-      image: ghcr.io/sphoffman/labhost:1.4
+      image: ghcr.io/sphoffman/labhost:1.5
       mgmt-ipv4: 172.20.20.101
       env:
         LAB_PASSWORD: lab
       binds:
+        - ./configs:/config
         - ./pcaps/client1:/pcaps
         - ./scripts:/scripts
-      capabilities:
-        add:
-          - NET_ADMIN
-          - NET_RAW
+      cap-add:
+        - NET_ADMIN
+        - NET_RAW
+      sysctls:
+        net.ipv4.tcp_l3mdev_accept: "1"
 
     client2:
       kind: linux
-      image: ghcr.io/sphoffman/labhost:1.4
+      image: ghcr.io/sphoffman/labhost:1.5
       mgmt-ipv4: 172.20.20.102
       env:
         LAB_PASSWORD: lab
       binds:
+        - ./configs:/config
         - ./pcaps/client2:/pcaps
         - ./scripts:/scripts
-      capabilities:
-        add:
-          - NET_ADMIN
-          - NET_RAW
+      cap-add:
+        - NET_ADMIN
+        - NET_RAW
+      sysctls:
+        net.ipv4.tcp_l3mdev_accept: "1"
 
   links:
     # Replace these with your actual Junos node/interface names.
