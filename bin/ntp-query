@@ -1,0 +1,18 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+    echo "Usage: ntp-query <server>" >&2
+    exit 2
+fi
+
+command -v chronyd >/dev/null 2>&1 || {
+    echo "ERROR: chronyd is not installed" >&2
+    exit 1
+}
+
+server="$1"
+timeout="${LABHOST_NTP_QUERY_TIMEOUT:-5}"
+
+chronyd -Q -t "$timeout" \
+    "server $server iburst maxsamples 1" 2>&1 | tail -8
