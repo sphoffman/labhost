@@ -23,7 +23,7 @@ FROM debian:13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENV LABHOST_VERSION="1.5-dev5"
+ENV LABHOST_VERSION="1.5-dev6"
 
 RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' | debconf-set-selections \
     && echo 'iperf3 iperf3/start_daemon boolean false' | debconf-set-selections \
@@ -41,6 +41,7 @@ COPY --from=mcjoin-builder /usr/local/ /usr/local/
 
 COPY bin/labctl /usr/local/lib/labhost/labctl
 COPY bin/endpointctl /usr/local/lib/labhost/endpointctl
+COPY bin/endpointctl-wrapper /usr/local/lib/labhost/endpointctl-wrapper
 COPY bin/servicectl /usr/local/lib/labhost/servicectl
 COPY bin/ntp-query /usr/local/lib/labhost/ntp-query
 COPY bin/radius-server-start /usr/local/lib/labhost/radius-server-start
@@ -58,8 +59,9 @@ COPY motd /etc/motd
 
 RUN sed -i "s/@LABHOST_VERSION@/${LABHOST_VERSION}/g" /etc/motd \
     && chmod 0755 \
-        /usr/local/lib/labhost/labctl /usr/local/lib/labhost/endpointctl /usr/local/lib/labhost/servicectl \
-        /usr/local/lib/labhost/ntp-query /usr/local/lib/labhost/radius-server-start /usr/local/lib/labhost/lab-reset-core \
+        /usr/local/lib/labhost/labctl /usr/local/lib/labhost/endpointctl /usr/local/lib/labhost/endpointctl-wrapper \
+        /usr/local/lib/labhost/servicectl /usr/local/lib/labhost/ntp-query /usr/local/lib/labhost/radius-server-start \
+        /usr/local/lib/labhost/lab-reset-core \
         /usr/local/bin/labctl /usr/local/bin/lab-help /usr/local/bin/lab-save /usr/local/bin/lab-reset \
         /usr/local/bin/dhcp-leases /usr/local/bin/pc-phone-create \
         /usr/local/bin/labhost-entrypoint /usr/local/lib/labhost/pc_phone_lldp.py \
@@ -86,7 +88,7 @@ RUN sed -i "s/@LABHOST_VERSION@/${LABHOST_VERSION}/g" /etc/motd \
         clients-list clients-status clients-arp clients-ping clients-traffic clients-iperf \
         iperf-server iperf-client iperf-udp iperf-reverse iperf-bidir iperf-parallel iperf-bind iperf-test \
         path-test send-tcp send-udp send-broadcast; \
-      do ln -sf /usr/local/lib/labhost/endpointctl "/usr/local/bin/$cmd"; done \
+      do ln -sf /usr/local/lib/labhost/endpointctl-wrapper "/usr/local/bin/$cmd"; done \
     && for cmd in \
         ntp-server-start ntp-server-stop ntp-server-status ntp-query \
         syslog-server-start syslog-server-stop syslog-server-status syslog-tail syslog-clear syslog-send \
