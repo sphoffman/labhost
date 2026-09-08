@@ -1,0 +1,36 @@
+name: Validate release image tags
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/publish-image.yml
+      - .github/workflows/validate-release-tags.yml
+      - scripts/release-version
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/publish-image.yml
+      - .github/workflows/validate-release-tags.yml
+      - scripts/release-version
+
+permissions:
+  contents: read
+
+jobs:
+  release-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release version helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/release-version
+          shellcheck scripts/release-version
+          test "$(bash scripts/release-version v1.5)" = "1.5"
+          test "$(bash scripts/release-version 1.5)" = "1.5"
+          test "$(bash scripts/release-version v1.5.1)" = "1.5.1"
+          test "$(bash scripts/release-version 1.5.1)" = "1.5.1"
+          ! bash scripts/release-version v1 >/dev/null 2>&1
+          ! bash scripts/release-version latest >/dev/null 2>&1
