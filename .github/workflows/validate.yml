@@ -133,13 +133,7 @@ jobs:
             ip link add eth3 type dummy
             ip link set eth3 mtu 9000
             ip link set eth3 up
-            python3 - <<"PY"
-import importlib.util
-spec=importlib.util.spec_from_file_location("pc_phone_lldp","/usr/local/lib/labhost/pc_phone_lldp.py")
-mod=importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-mod.provision("eth3","02:00:00:00:11:11",1111,True,0,0,"/tmp/eth3.state",False)
-PY
+            python3 -c "import importlib.util; spec=importlib.util.spec_from_file_location(\"pc_phone_lldp\",\"/usr/local/lib/labhost/pc_phone_lldp.py\"); mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); mod.provision(\"eth3\",\"02:00:00:00:11:11\",1111,True,0,0,\"/tmp/eth3.state\",False)"
             test "$(cat /sys/class/net/pp-eth3-v1111/mtu)" = "1500"
             test "$(sysctl -n net.ipv4.conf.pp-eth3-v1111.arp_ignore)" = "1"
             test "$(sysctl -n net.ipv4.conf.pp-eth3-v1111.arp_announce)" = "2"
