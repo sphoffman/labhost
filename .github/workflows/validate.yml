@@ -48,6 +48,7 @@ jobs:
           push: false
           load: true
           tags: labhost:validate
+
       - name: Verify helper surface
         run: |
           docker run --rm --entrypoint /bin/bash labhost:validate -lc '
@@ -75,6 +76,7 @@ jobs:
             lab-help iperf-server | grep -q "iperf-server \[port\] \[--interface <iface>\]"
             lab-help | grep -q clients-iperf
           '
+
       - name: Verify endpoint discovery
         run: |
           docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW --entrypoint /bin/bash labhost:validate -lc '
@@ -100,6 +102,7 @@ jobs:
             clients-status --pcs | grep -q pp-eth1-pc
             clients-status --phones | grep -q pp-eth1-v1111
           '
+
       - name: Verify ip-set replacement semantics
         run: |
           docker run --rm --cap-add NET_ADMIN --entrypoint /bin/bash labhost:validate -lc '
@@ -113,46 +116,24 @@ jobs:
             grep -q "10.10.10.20/24" /tmp/eth1-addrs
             ! grep -q "192.0.2.2/24" /tmp/eth1-addrs
           '
-      - name: Verify synthetic client creation
+
+      - name: Verify synthetic client defaults
         run: |
-          docker run --rm --cap-add NET_ADMIN --entrypoint /bin/bash labhost:validate -lc '
+          docker run --rm --privileged --entrypoint /bin/bash labhost:validate -lc '
             set -e
             ip link add eth1 type dummy
             ip link set eth1 mtu 9000
             ip link set eth1 up
             clients-create eth1 1 198.51.100.0/24 10
-            client="$(find /sys/class/net -maxdepth 1 -type l -name "cl*" -printf "%f\n" | head -1)"
-            test -n "$client"
-            ip link show "$client" >/dev/null
+            ip link show cl001 >/dev/null
+            test "$(cat /sys/class/net/cl001/mtu)" = "1500"
+            test "$(sysctl -n net.ipv4.conf.cl001.arp_ignore)" = "1"
+            test "$(sysctl -n net.ipv4.conf.cl001.arp_announce)" = "2"
           '
-      - name: Verify synthetic client MTU
-        run: |
-          docker run --rm --cap-add NET_ADMIN --entrypoint /bin/bash labhost:validate -lc '
-            set -e
-            ip link add eth1 type dummy
-            ip link set eth1 mtu 9000
-            ip link set eth1 up
-            clients-create eth1 1 198.51.100.0/24 10
-            client="$(find /sys/class/net -maxdepth 1 -type l -name "cl*" -printf "%f\n" | head -1)"
-            test -n "$client"
-            test "$(cat /sys/class/net/$client/mtu)" = "1500"
-          '
-      - name: Verify synthetic client ARP isolation
-        run: |
-          docker run --rm --cap-add NET_ADMIN --entrypoint /bin/bash labhost:validate -lc '
-            set -e
-            ip link add eth1 type dummy
-            ip link set eth1 mtu 9000
-            ip link set eth1 up
-            clients-create eth1 1 198.51.100.0/24 10
-            client="$(find /sys/class/net -maxdepth 1 -type l -name "cl*" -printf "%f\n" | head -1)"
-            test -n "$client"
-            test "$(sysctl -n net.ipv4.conf.$client.arp_ignore)" = "1"
-            test "$(sysctl -n net.ipv4.conf.$client.arp_announce)" = "2"
-          '
+
       - name: Verify PC endpoint defaults
         run: |
-          docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW --entrypoint /bin/bash labhost:validate -lc '
+          docker run --rm --privileged --entrypoint /bin/bash labhost:validate -lc '
             set -e
             ip link add eth2 type dummy
             ip link set eth2 mtu 9000
@@ -163,9 +144,10 @@ jobs:
             test "$(sysctl -n net.ipv4.conf.pp-eth2-pc.arp_announce)" = "2"
             pc-phone-delete eth2
           '
+
       - name: Verify tagged phone endpoint defaults
         run: |
-          docker run --rm --cap-add NET_ADMIN --entrypoint /bin/bash labhost:validate -lc '
+          docker run --rm --privileged --entrypoint /bin/bash labhost:validate -lc '
             set -e
             ip link add eth3 type dummy
             ip link set eth3 mtu 9000
@@ -175,6 +157,7 @@ jobs:
             test "$(sysctl -n net.ipv4.conf.pp-eth3-v1111.arp_ignore)" = "1"
             test "$(sysctl -n net.ipv4.conf.pp-eth3-v1111.arp_announce)" = "2"
           '
+
       - name: Verify lightweight services and persistence
         run: |
           docker run --rm --cap-add NET_ADMIN --cap-add NET_RAW --entrypoint /bin/bash labhost:validate -lc '
