@@ -23,7 +23,7 @@ FROM debian:13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ENV LABHOST_VERSION="1.5-dev4"
+ENV LABHOST_VERSION="1.5-dev5"
 
 RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' | debconf-set-selections \
     && echo 'iperf3 iperf3/start_daemon boolean false' | debconf-set-selections \
@@ -56,7 +56,8 @@ COPY entrypoint.sh /usr/local/bin/labhost-entrypoint
 COPY README.md /usr/local/share/labhost/README.md
 COPY motd /etc/motd
 
-RUN chmod 0755 \
+RUN sed -i "s/@LABHOST_VERSION@/${LABHOST_VERSION}/g" /etc/motd \
+    && chmod 0755 \
         /usr/local/lib/labhost/labctl /usr/local/lib/labhost/endpointctl /usr/local/lib/labhost/servicectl \
         /usr/local/lib/labhost/ntp-query /usr/local/lib/labhost/radius-server-start /usr/local/lib/labhost/lab-reset-core \
         /usr/local/bin/labctl /usr/local/bin/lab-help /usr/local/bin/lab-save /usr/local/bin/lab-reset \
