@@ -8,7 +8,7 @@ topology:
   nodes:
     host1:
       kind: linux
-      image: ghcr.io/sphoffman/labhost:1.5-dev6
+      image: ghcr.io/sphoffman/labhost:1.5-dev7
       env:
         LAB_PASSWORD: lab
       binds:
@@ -21,7 +21,7 @@ topology:
 
     host2:
       kind: linux
-      image: ghcr.io/sphoffman/labhost:1.5-dev6
+      image: ghcr.io/sphoffman/labhost:1.5-dev7
       env:
         LAB_PASSWORD: lab
       binds:
