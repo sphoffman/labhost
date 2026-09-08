@@ -58,35 +58,39 @@ emit_services(){
     emit_file "$SERVICE_INTENT_DIR/radius-server.conf"
 }
 
+build_startup(){
+    "$CORE" lab-save --dry-run | normalize_startup
+    emit_services
+}
+
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     exec "$CORE" lab-save --help
 fi
 
 if [[ "${1:-}" == "--dry-run" ]]; then
     [[ $# -eq 1 ]] || { echo 'Usage: lab-save [--dry-run]' >&2; exit 2; }
-    "$CORE" lab-save --dry-run | normalize_startup
-    emit_services
+    build_startup
     exit 0
 fi
 
 [[ $# -eq 0 ]] || { echo 'Usage: lab-save [--dry-run]' >&2; exit 2; }
+[[ -d /config ]] || { echo "ERROR: /config is not mounted. Add './configs:/config' to the Containerlab node." >&2; exit 1; }
 
-# Let the proven v1.4 implementation generate and safely write the base startup
-# file first, including its backup/root-owned bind-mount handling.
-"$CORE" lab-save
-
-# Normalize synthetic-client dependencies before appending v1.5 service intent.
-# The core saver already created the .bak before this rewrite.
+# Generate the complete startup file as the invoking user, then use controlled
+# self-elevation only for the bind-mounted write. This deliberately avoids any
+# requirement for a matching host-side `lab` account or UID and works when the
+# host repository/config directory is root-owned.
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
-normalize_startup <"$STARTUP" >"$tmp"
+build_startup >"$tmp"
+
+if [[ -f "$STARTUP" ]]; then
+    sudo install -o root -g root -m 0755 "$STARTUP" "${STARTUP}.bak"
+fi
+
 sudo install -o root -g root -m 0755 "$tmp" "$STARTUP"
 
-if compgen -G "$SERVICE_INTENT_DIR/*.conf" >/dev/null; then
-    : >"$tmp"
-    emit_services >"$tmp"
-    sudo dd if="$tmp" of="$STARTUP" oflag=append conv=notrunc status=none
-    sudo chown root:root "$STARTUP"
-    sudo chmod 0755 "$STARTUP"
-    echo "Appended LabHost v1.5 service intent to $STARTUP"
+echo "Saved startup configuration: $STARTUP"
+if [[ -f "${STARTUP}.bak" ]]; then
+    echo "Previous configuration backup: ${STARTUP}.bak"
 fi
