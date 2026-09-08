@@ -49,7 +49,8 @@ jobs:
         run: |
           docker run --rm --entrypoint /bin/bash labhost:validate -lc '
             set -e
-            test "$LABHOST_VERSION" = "1.5-dev4"
+            test "$LABHOST_VERSION" = "1.5-dev5"
+            grep -q "labhost ${LABHOST_VERSION} -" /etc/motd
             command -v clients-iperf
             command -v ntp-server-start
             command -v ntp-query
@@ -162,4 +163,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}:1.5-dev4
+          tags: ghcr.io/${{ github.repository }}:1.5-dev5
