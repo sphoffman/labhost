@@ -14,10 +14,9 @@ topology:
         LAB_PASSWORD: lab
       sysctls:
         net.ipv4.tcp_l3mdev_accept: 1
-      capabilities:
-        add:
-          - NET_ADMIN
-          - NET_RAW
+      cap-add:
+        - NET_ADMIN
+        - NET_RAW
 
     host2:
       kind: linux
@@ -27,10 +26,9 @@ topology:
         LAB_PASSWORD: lab
       sysctls:
         net.ipv4.tcp_l3mdev_accept: 1
-      capabilities:
-        add:
-          - NET_ADMIN
-          - NET_RAW
+      cap-add:
+        - NET_ADMIN
+        - NET_RAW
 
   links:
     - endpoints: ["host1:eth1", "host2:eth1"]
