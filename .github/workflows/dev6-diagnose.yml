@@ -1,0 +1,76 @@
+name: Dev6 Synthetic Client Diagnose
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: labhost:dev6-diagnose
+
+      - name: Client creation
+        id: creation
+        continue-on-error: true
+        run: |
+          docker run --rm --cap-add NET_ADMIN --entrypoint /bin/bash labhost:dev6-diagnose -lc '
+            set -euxo pipefail
+            ip link add eth1 type dummy
+            ip link set eth1 mtu 9000
+            ip link set eth1 up
+            clients-create eth1 1 198.51.100.0/24 10
+            ip -d link show type macvlan
+            clients-list --clients
+            ip link show cl001
+          '
+
+      - name: Client MTU
+        id: mtu
+        continue-on-error: true
+        run: |
+          docker run --rm --cap-add NET_ADMIN --entrypoint /bin/bash labhost:dev6-diagnose -lc '
+            set -euxo pipefail
+            ip link add eth1 type dummy
+            ip link set eth1 mtu 9000
+            ip link set eth1 up
+            clients-create eth1 1 198.51.100.0/24 10
+            cat /sys/class/net/cl001/mtu
+            test "$(cat /sys/class/net/cl001/mtu)" = "1500"
+          '
+
+      - name: Client ARP isolation
+        id: arp
+        continue-on-error: true
+        run: |
+          docker run --rm --cap-add NET_ADMIN --entrypoint /bin/bash labhost:dev6-diagnose -lc '
+            set -euxo pipefail
+            ip link add eth1 type dummy
+            ip link set eth1 mtu 9000
+            ip link set eth1 up
+            clients-create eth1 1 198.51.100.0/24 10
+            sysctl net.ipv4.conf.cl001.arp_ignore
+            sysctl net.ipv4.conf.cl001.arp_announce
+            test "$(sysctl -n net.ipv4.conf.cl001.arp_ignore)" = "1"
+            test "$(sysctl -n net.ipv4.conf.cl001.arp_announce)" = "2"
+          '
+
+      - name: Gate diagnostic results
+        if: always()
+        run: |
+          echo "creation=${{ steps.creation.outcome }}"
+          echo "mtu=${{ steps.mtu.outcome }}"
+          echo "arp=${{ steps.arp.outcome }}"
+          test "${{ steps.creation.outcome }}" = success
+          test "${{ steps.mtu.outcome }}" = success
+          test "${{ steps.arp.outcome }}" = success
